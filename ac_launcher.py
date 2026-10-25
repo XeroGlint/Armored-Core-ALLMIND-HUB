@@ -9,7 +9,7 @@ Data: ~/.ac_launcher/config.json
 """
 import json, os, queue, re, shutil, subprocess, sys, threading, time, zipfile
 import html as htmllib
-import hashlib, math, ssl, struct
+import hashlib, math, random, ssl, struct
 import urllib.error
 import xml.etree.ElementTree as ET
 import urllib.parse, urllib.request
@@ -872,6 +872,131 @@ SOUNDTRACKS = [
 ]
 
 
+# ---- RetroAchievements (read-only web API; you supply your own username + Web API key) -----------------
+RA_CONSOLES = {12: "PS1", 21: "PS2", 41: "PSP"}   # RetroAchievements console IDs. PS3 and PC aren't supported by the service.
+
+
+def ra_call(endpoint, key, user=None, **params):
+    q = {"y": key, **params}
+    if user: q["z"] = user
+    try:
+        raw = http_get("https://retroachievements.org/API/" + endpoint + "?" + urllib.parse.urlencode(q)).read()
+    except urllib.error.HTTPError as ex:
+        raise RuntimeError(f"RetroAchievements answered HTTP {ex.code}: check your username and Web API key")
+    data = json.loads(raw.decode("utf8", "ignore"))
+    if isinstance(data, dict) and ("Error" in data or ("message" in data and len(data) <= 3)):
+        raise RuntimeError(str(data.get("Error") or data.get("message")))
+    return data
+
+
+def ra_ac_games(key, user):
+    """Armored Core sets that exist on RetroAchievements (cached for a week: the service asks clients to cache)."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    out = []
+    for cid, name in RA_CONSOLES.items():
+        cf = CACHE / f"ra_games_{cid}.json"
+        if cf.exists() and time.time() - cf.stat().st_mtime < 7 * 86400:
+            games = json.loads(cf.read_text(encoding="utf8"))
+        else:
+            data = ra_call("API_GetGameList.php", key, user, i=cid, f=1)
+            games = [g for g in data if re.search(r"armored core|silent line", g.get("Title", ""), re.I)
+                     and not g.get("Title", "").startswith("~")]
+            cf.write_text(json.dumps(games), encoding="utf8")
+        for g in games:
+            out.append({"id": g["ID"], "title": g["Title"], "console": name, "ach": g.get("NumAchievements", 0),
+                        "lb": g.get("NumLeaderboards", 0), "pts": g.get("Points", 0)})
+    return sorted(out, key=lambda g: (g["console"], g["title"]))
+
+
+def ra_boot(key, user):
+    return ra_call("API_GetUserProfile.php", key, user, u=user), ra_ac_games(key, user)
+
+
+def ra_game(key, user, gid):
+    info = ra_call("API_GetGameInfoAndUserProgress.php", key, user, g=gid, u=user)
+    ach = info.get("Achievements") or {}
+    ach = list(ach.values()) if isinstance(ach, dict) else list(ach)
+    ach.sort(key=lambda a: a.get("DisplayOrder", 0))
+    try:
+        lbs = ra_call("API_GetGameLeaderboards.php", key, user, i=gid, c=200).get("Results", [])
+    except Exception as ex:
+        log(f"ra leaderboards {gid}: {ex!r}"); lbs = []
+    got = [a for a in ach if a.get("DateEarned") or a.get("DateEarnedHardcore")]
+    return {"id": gid, "title": info.get("Title", ""), "ach": ach, "lb": lbs,
+            "earned": len(got), "total": len(ach), "pts_earned": sum(int(a.get("Points", 0)) for a in got),
+            "pts_total": sum(int(a.get("Points", 0)) for a in ach)}
+
+
+def ra_entries(key, user, lbid, title):
+    return {"title": title, "rows": ra_call("API_GetLeaderboardEntries.php", key, user, i=lbid, c=25).get("Results", [])}
+
+
+# ---- in-launcher audio player (Windows MCI: no extra packages) ------------------------------------------
+AUDIO_EXTS = {".mp3", ".wav", ".wma", ".mid", ".midi", ".flac", ".m4a", ".aac", ".ogg"}
+MUSIC_DIR = CFG_PATH.parent / "music"
+
+
+class McPlayer:
+    """Small audio engine on Windows' built-in MCI. Plays mp3, wav, wma and midi; flac, m4a, aac and ogg depend on
+    the codecs installed in Windows."""
+    A = "acplayer"
+
+    def __init__(self): self.is_open = False
+
+    def _cmd(self, c):
+        import ctypes
+        buf = ctypes.create_unicode_buffer(300)
+        err = ctypes.windll.winmm.mciSendStringW(c, buf, 299, 0)
+        if err:
+            eb = ctypes.create_unicode_buffer(300)
+            ctypes.windll.winmm.mciGetErrorStringW(err, eb, 299)
+            raise RuntimeError(eb.value or f"MCI error {err}")
+        return buf.value
+
+    def load(self, path):
+        self.close()
+        self._cmd(f'open "{path}" alias {self.A}')
+        self.is_open = True
+        self._cmd(f"set {self.A} time format milliseconds")
+
+    def play(self): self._cmd(f"play {self.A}")
+    def pause(self): self._cmd(f"pause {self.A}")
+    def resume(self): self._cmd(f"resume {self.A}")
+    def stop(self): self._cmd(f"stop {self.A}")
+    def seek(self, ms): self._cmd(f"seek {self.A} to {int(ms)}"); self._cmd(f"play {self.A}")
+    def mode(self): return self._cmd(f"status {self.A} mode")
+    def length(self): return int(self._cmd(f"status {self.A} length") or 0)
+    def pos(self): return int(self._cmd(f"status {self.A} position") or 0)
+
+    def volume(self, v):
+        try: self._cmd(f"setaudio {self.A} volume to {int(v) * 10}")
+        except RuntimeError: pass
+
+    def close(self):
+        if self.is_open:
+            try: self._cmd(f"close {self.A}")
+            except RuntimeError: pass
+            self.is_open = False
+
+
+def next_track(idx, n, loop, shuffle, auto, played):
+    """Pick the next playlist index (None = stop). loop: 0 off, 1 all, 2 one."""
+    if n == 0: return None
+    if auto and loop == 2: return idx
+    if shuffle and n > 1:
+        if auto and loop == 0 and played >= n: return None
+        return random.choice([x for x in range(n) if x != idx])
+    i = idx + 1
+    if i >= n:
+        return 0 if (loop == 1 or not auto) else None
+    return i
+
+
+def fmt_ms(ms):
+    ms = max(0, int(ms) // 1000)
+    return f"{ms // 60:02d}:{ms % 60:02d}"
+
+
 def norm(s): return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
@@ -932,6 +1057,13 @@ class App(tk.Tk):
         self.photos, self.wiki, self.wiki_fail, self.fetching, self.sel_lore = {}, {}, {}, set(), None
         self.glint_x, self.glint_wait = None, 40
         self.updates, self.checking, self.check_win, self.check_body = set(), False, None, None
+        self.cur_tab = "LIBRARY"
+        self.mus = McPlayer() if os.name == "nt" else None
+        self.music = [p for p in self.cfg.get("playlist", []) if os.path.exists(p)]
+        self.mus_idx, self.mus_state, self.mus_started, self.mus_len, self.mus_count = -1, "stopped", 0.0, 0, 0
+        self.mus_hist, self.mus_was_playing, self.viz_h = [], False, [0.05] * 32
+        self.mus_loop, self.mus_shuffle = self.cfg.get("music_loop", 0), self.cfg.get("music_shuffle", False)
+        self.ra_ok, self.ra_loading, self.ra_games, self.ra_cur, self.ra_view = False, False, [], None, "ach"
         globals()["LAUNCH_VIA_CMD"] = bool(self.cfg.get("cmd_launch"))
         self.autodetect()
         self.style_setup()
@@ -941,6 +1073,8 @@ class App(tk.Tk):
         self.poll()
         self.typewrite("AC SYSTEM BOOT ... ALL SYSTEMS NOMINAL", 0)
         self.anim()
+        self.music_tick()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(700, self.startup)
 
     def F(self, size=10, bold=False):
@@ -1010,6 +1144,8 @@ class App(tk.Tk):
         mid = self.panel(center, "AVAILABLE ARMORED CORES"); self.tab_frames["LIBRARY"] = mid
         self.build_archive(center)
         self.build_soundtracks(center)
+        self.build_music(center)
+        self.build_achievements(center)
         sr = tk.Frame(mid, bg=PANEL); sr.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(sr, text="SEARCH >", bg=PANEL, fg=DIM, font=self.F(9)).pack(side="left")
         self.q = tk.StringVar(); self.q.trace_add("write", lambda *_: self.refresh())
@@ -1202,7 +1338,7 @@ class App(tk.Tk):
     def build_tabs(self, center):
         self.tab_frames, self.tab_btns = {}, {}
         bar = tk.Frame(center, bg=BG); bar.pack(fill="x", pady=(0, 6))
-        for name in ("LIBRARY", "ARCHIVE", "SOUNDTRACKS"):
+        for name in ("LIBRARY", "ARCHIVE", "SOUNDTRACKS", "MUSIC", "ACHIEVEMENTS"):
             b = tk.Label(bar, text=name, bg=PANEL2, fg=TEXT, font=self.F(10, True), padx=22, pady=6,
                          cursor="hand2", highlightthickness=1, highlightbackground=LINE)
             b.pack(side="left", padx=(0, 4)); b.bind("<Button-1>", lambda e, n=name: self.show_tab(n))
@@ -1213,7 +1349,9 @@ class App(tk.Tk):
         self.tab_frames[name].pack(fill="both", expand=True)
         for n, b in self.tab_btns.items():
             on = n == name; b.config(bg=ORANGE if on else PANEL2, fg=ACC_FG if on else TEXT)
-        self.right.grid_remove() if name in ("ARCHIVE", "SOUNDTRACKS") else self.right.grid()
+        self.right.grid_remove() if name in ("ARCHIVE", "SOUNDTRACKS", "MUSIC", "ACHIEVEMENTS") else self.right.grid()
+        self.cur_tab = name
+        if name == "ACHIEVEMENTS": self.ra_open()
 
     def build_archive(self, center):
         a = self.panel(center, "ARCHIVE // LORE & HISTORY"); self.tab_frames["ARCHIVE"] = a
@@ -1376,6 +1514,8 @@ class App(tk.Tk):
                 elif m[0] == "err":
                     self.status.config(text=f"{EMULATORS[m[1]]['name'].upper()} INSTALL FAILED", fg=RED)
                     messagebox.showerror("Install failed", f"{EMULATORS[m[1]]['name']}: {m[2]}\n\nCheck your connection, or use SET PATH MANUALLY.")
+                elif m[0] == "ra":
+                    self.on_ra(m[1], m[2], m[3])
                 elif m[0] == "pkg":
                     self.on_pkg(m[1], m[2], m[3])
                 elif m[0] == "cli":
@@ -1781,6 +1921,7 @@ class App(tk.Tk):
             ("cache", "CACHED ART & LORE", "Downloaded cover art, screenshots and articles. Re-downloaded when needed.", [CACHE], True),
             ("downloads", "DOWNLOADED UPDATES & FIRMWARE", "Game update packages and firmware installers fetched by the launcher.", [dl], True),
             ("log", "LOG FILE", "Error log.", [home / "log.txt"], True),
+            ("music", "MUSIC LIBRARY", "Songs you imported into the launcher's music player.", [MUSIC_DIR], False),
             ("slots", "SAVE SLOTS & BACKUPS", "Your launcher save slots and backup zips. These are copies of your save data.", [SLOT_ROOT, bk], False),
             ("emus", "EMULATORS (AND THEIR SAVES, BIOS, FIRMWARE, CONFIGS)", "Everything in the emulator folders the launcher installed, including saves, BIOS, PS3 firmware and installed PS3 updates.", [EMU_HOME], False),
         ]
@@ -1928,6 +2069,7 @@ class App(tk.Tk):
         except OSError as ex:
             return messagebox.showerror("Steam", f"Couldn't start Steam: {ex}")
         self.running = True; self.led.config(fg=WARN)
+        self.music_suspend()
         self.status.config(text=f"\u25b6 STARTING VIA STEAM: {e['title'].upper()}", fg=WARN)
         self.iconify()
         self.after(3000, lambda: self.watch_steam(k, time.time(), None))
@@ -1940,7 +2082,7 @@ class App(tk.Tk):
         e = self.cfg["library"][k]
         if seen_at: e["playtime"] += time.time() - seen_at; e["last"] = time.time()
         save_cfg(self.cfg); self.running = False
-        self.deiconify(); self.status.config(fg=TEXT); self.refresh()
+        self.deiconify(); self.status.config(fg=TEXT); self.refresh(); self.music_resume()
         self.typewrite("SORTIE COMPLETE ... WELCOME BACK, 621", 0)
 
     def steam_card(self):
@@ -2008,6 +2150,373 @@ class App(tk.Tk):
         k = getattr(self, "ost_sel", "__overview")
         q = "Armored Core soundtrack" if k == "__overview" else next(x[5] for x in SOUNDTRACKS if x[0] == k)
         webbrowser.open("https://www.youtube.com/results?search_query=" + urllib.parse.quote(q))
+
+    # ---- shared widget helper ---------------------------------------------------------------------
+    def entry(self, parent, var, width, **kw):
+        return tk.Entry(parent, textvariable=var, width=width, bg=BG, fg=CYAN, insertbackground=CYAN, relief="flat",
+                        font=self.F(10), highlightthickness=1, highlightbackground=LINE, highlightcolor=ORANGE, **kw)
+
+    def on_close(self):
+        try:
+            if self.mus: self.mus.close()
+            save_cfg(self.cfg)
+        finally:
+            self.destroy()
+
+    # ---- RetroAchievements tab ---------------------------------------------------------------------
+    def ra_creds(self):
+        r = self.cfg.get("ra") or {}
+        return r.get("user", "").strip(), r.get("key", "").strip()
+
+    def ra_thread(self, kind, fn, *args):
+        def work():
+            try: self.msgs.put(("ra", kind, fn(*args), None))
+            except Exception as ex:
+                log(f"ra {kind}: {ex!r}"); self.msgs.put(("ra", kind, None, str(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def build_achievements(self, center):
+        a = self.panel(center, "RETROACHIEVEMENTS // ACHIEVEMENTS & LEADERBOARDS"); self.tab_frames["ACHIEVEMENTS"] = a
+        u, k = self.ra_creds()
+        top = tk.Frame(a, bg=PANEL); top.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(top, text="USER", bg=PANEL, fg=DIM, font=self.F(8, True)).pack(side="left")
+        self.ra_user = tk.StringVar(value=u); self.entry(top, self.ra_user, 14).pack(side="left", padx=(4, 10), ipady=3)
+        tk.Label(top, text="WEB API KEY", bg=PANEL, fg=DIM, font=self.F(8, True)).pack(side="left")
+        self.ra_key = tk.StringVar(value=k); self.entry(top, self.ra_key, 22, show="\u2022").pack(side="left", padx=(4, 10), ipady=3)
+        self.button(top, "CONNECT", self.ra_connect, accent=True).pack(side="left")
+        self.button(top, "DISCONNECT", self.ra_disconnect).pack(side="left", padx=6)
+        self.button(top, "GET KEY", lambda: webbrowser.open("https://retroachievements.org/controlpanel.php")).pack(side="left")
+        self.ra_status = tk.Label(a, text="", bg=PANEL, fg=DIM, font=self.F(9), anchor="w", justify="left", wraplength=px(820))
+        self.ra_status.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(a, text="RetroAchievements covers PS1, PS2 and PSP games (not PS3 or PC). To EARN achievements, turn on RetroAchievements inside DuckStation, "
+                         "PCSX2 or PPSSPP (Settings > Achievements) and log in there; this tab shows your progress and the leaderboards.",
+                 bg=PANEL, fg=DIM, font=self.F(8), anchor="w", justify="left", wraplength=px(820)).pack(fill="x", padx=12, pady=(0, 6))
+        body = tk.Frame(a, bg=PANEL); body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.ra_games_tree = ttk.Treeview(body, columns=("con", "ach"), show="tree headings", style="AC.Treeview", selectmode="browse")
+        self.ra_games_tree.heading("#0", text="ARMORED CORE SETS"); self.ra_games_tree.heading("con", text="SYS"); self.ra_games_tree.heading("ach", text="ACH")
+        self.ra_games_tree.column("#0", width=px(240)); self.ra_games_tree.column("con", width=px(50), anchor="center"); self.ra_games_tree.column("ach", width=px(50), anchor="center")
+        self.ra_games_tree.pack(side="left", fill="y")
+        self.ra_games_tree.bind("<<TreeviewSelect>>", self.ra_pick)
+        right = tk.Frame(body, bg=PANEL); right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        bar = tk.Frame(right, bg=PANEL); bar.pack(fill="x")
+        self.ra_tab_btns = {}
+        for key, label in (("ach", "ACHIEVEMENTS"), ("lb", "LEADERBOARDS")):
+            b = tk.Label(bar, text=label, padx=14, pady=5, cursor="hand2", font=self.F(9, True), highlightthickness=1, highlightbackground=LINE)
+            b.pack(side="left", padx=(0, 4)); b.bind("<Button-1>", lambda e, k=key: self.ra_set_view(k)); self.ra_tab_btns[key] = b
+        self.ra_summary = tk.Label(bar, text="", bg=PANEL, fg=CYAN, font=self.F(9, True)); self.ra_summary.pack(side="right")
+        box = tk.Frame(right, bg=PANEL); box.pack(fill="both", expand=True, pady=(6, 0))
+        self.ra_ach = ttk.Treeview(box, columns=("desc", "pts", "earned"), show="tree headings", style="AC.Treeview", selectmode="browse")
+        for c, t, w in (("#0", "ACHIEVEMENT", 230), ("desc", "HOW TO UNLOCK", 320), ("pts", "PTS", 50), ("earned", "EARNED", 110)):
+            self.ra_ach.heading(c, text=t); self.ra_ach.column(c, width=px(w), anchor="w" if c in ("#0", "desc") else "center")
+        self.ra_ach.tag_configure("earned", foreground=CYAN); self.ra_ach.tag_configure("locked", foreground=DIM)
+        self.ra_lb = ttk.Treeview(box, columns=("desc", "top", "score"), show="tree headings", style="AC.Treeview", selectmode="browse")
+        for c, t, w in (("#0", "LEADERBOARD", 230), ("desc", "WHAT IT TRACKS", 280), ("top", "TOP PLAYER", 100), ("score", "TOP SCORE", 100)):
+            self.ra_lb.heading(c, text=t); self.ra_lb.column(c, width=px(w), anchor="w" if c in ("#0", "desc") else "center")
+        self.ra_lb.bind("<Double-1>", self.ra_open_board)
+        self.ra_set_view("ach")
+
+    def ra_set_view(self, v):
+        self.ra_view = v
+        for k, b in self.ra_tab_btns.items():
+            on = k == v; b.config(bg=ORANGE if on else PANEL2, fg=ACC_FG if on else TEXT)
+        self.ra_ach.pack_forget(); self.ra_lb.pack_forget()
+        (self.ra_ach if v == "ach" else self.ra_lb).pack(fill="both", expand=True)
+
+    def ra_open(self):
+        u, k = self.ra_creds()
+        if not (u and k):
+            self.ra_status.config(text="Enter your RetroAchievements username and Web API key (RetroAchievements > Settings > Keys), then press CONNECT.", fg=DIM)
+        elif not self.ra_ok and not self.ra_loading:
+            self.ra_connect(silent=True)
+
+    def ra_connect(self, silent=False):
+        u, k = self.ra_user.get().strip(), self.ra_key.get().strip()
+        if not (u and k):
+            return None if silent else messagebox.showinfo("RetroAchievements", "Enter your username and Web API key first.")
+        self.cfg["ra"] = {"user": u, "key": k}; save_cfg(self.cfg)
+        self.ra_loading = True; self.ra_status.config(text="Connecting to RetroAchievements ...", fg=ORANGE)
+        self.ra_thread("boot", ra_boot, k, u)
+
+    def ra_disconnect(self):
+        self.cfg.pop("ra", None); save_cfg(self.cfg)
+        self.ra_ok = False; self.ra_games = []; self.ra_user.set(""); self.ra_key.set("")
+        for t in (self.ra_games_tree, self.ra_ach, self.ra_lb): t.delete(*t.get_children())
+        self.ra_summary.config(text=""); self.ra_status.config(text="Disconnected. Your key was removed from the launcher's settings.", fg=DIM)
+
+    def ra_pick(self, *_):
+        sel = self.ra_games_tree.selection()
+        if not sel: return
+        u, k = self.ra_creds(); self.ra_cur = int(sel[0])
+        self.ra_summary.config(text="LOADING ...")
+        self.ra_thread("game", ra_game, k, u, int(sel[0]))
+
+    def ra_open_board(self, *_):
+        sel = self.ra_lb.selection()
+        if not sel: return
+        u, k = self.ra_creds(); title = self.ra_lb.item(sel[0], "text")
+        self.ra_thread("entries", ra_entries, k, u, int(sel[0]), title)
+
+    def on_ra(self, kind, data, err):
+        if kind == "boot":
+            self.ra_loading = False
+            if err:
+                self.ra_ok = False
+                return self.ra_status.config(text=f"Could not connect: {err}", fg=RED)
+            prof, games = data; self.ra_ok = True; self.ra_games = games
+            self.ra_status.config(text=f"Connected as {prof.get('User', '')}  //  {prof.get('TotalPoints', 0)} points  //  "
+                                       f"{prof.get('TotalTruePoints', 0)} true points  //  member since {str(prof.get('MemberSince', ''))[:10]}", fg=CYAN)
+            self.ra_games_tree.delete(*self.ra_games_tree.get_children())
+            for g in games:
+                self.ra_games_tree.insert("", "end", iid=str(g["id"]), text=g["title"], values=(g["console"], g["ach"]))
+            if not games:
+                self.ra_status.config(text=self.ra_status.cget("text") + "  //  No Armored Core sets found for PS1, PS2 or PSP on RetroAchievements right now.")
+            elif self.ra_games_tree.get_children():
+                self.ra_games_tree.selection_set(self.ra_games_tree.get_children()[0])
+        elif kind == "game":
+            if err: return self.ra_summary.config(text=f"ERROR: {err}"[:90])
+            if data["id"] != self.ra_cur: return
+            self.ra_ach.delete(*self.ra_ach.get_children()); self.ra_lb.delete(*self.ra_lb.get_children())
+            todo = []
+            for a in data["ach"]:
+                d = a.get("DateEarnedHardcore") or a.get("DateEarned")
+                iid = str(a.get("ID"))
+                self.ra_ach.insert("", "end", iid=iid, text=a.get("Title", ""), tags=("earned" if d else "locked",),
+                                   values=(a.get("Description", ""), a.get("Points", 0), ("\u2714 " + str(d)[:10]) if d else "-"))
+                if a.get("BadgeName"): todo.append((iid, a["BadgeName"], bool(d)))
+            for lb in data["lb"]:
+                top = lb.get("TopEntry") or {}
+                self.ra_lb.insert("", "end", iid=str(lb.get("ID")), text=lb.get("Title", ""),
+                                  values=(lb.get("Description", ""), top.get("User", "-"), top.get("FormattedScore", top.get("Score", "-"))))
+            self.ra_summary.config(text=f"{data['earned']}/{data['total']} earned  //  {data['pts_earned']}/{data['pts_total']} pts  //  {len(data['lb'])} leaderboards  (double-click a leaderboard)")
+            if todo: self.ra_badges(todo, data["id"])
+        elif kind == "badge":
+            iid, path = data
+            ph = self.photo(path, (px(26), px(26)))
+            if ph and self.ra_ach.exists(iid): self.ra_ach.item(iid, image=ph)
+        elif kind == "entries":
+            if err: return messagebox.showerror("Leaderboard", err)
+            d = tk.Toplevel(self, bg=PANEL, highlightthickness=1, highlightbackground=ORANGE)
+            d.title("LEADERBOARD"); d.transient(self)
+            d.geometry(f"{px(560)}x{px(560)}+{self.winfo_x() + px(180)}+{self.winfo_y() + px(60)}")
+            tk.Label(d, text="\u25a0 " + data["title"].upper(), bg=PANEL, fg=ORANGE, font=self.F(12, True), wraplength=px(520), justify="left").pack(anchor="w", padx=16, pady=(14, 6))
+            t = ttk.Treeview(d, columns=("rank", "user", "score", "date"), show="headings", style="AC.Treeview")
+            for c, tx, w in (("rank", "#", 50), ("user", "PLAYER", 190), ("score", "SCORE", 120), ("date", "DATE", 110)):
+                t.heading(c, text=tx); t.column(c, width=px(w), anchor="center" if c != "user" else "w")
+            for r in data["rows"]:
+                t.insert("", "end", values=(r.get("Rank"), r.get("User"), r.get("FormattedScore", r.get("Score")), str(r.get("DateSubmitted", ""))[:10]))
+            t.pack(fill="both", expand=True, padx=16)
+            self.button(d, "CLOSE", d.destroy).pack(anchor="e", padx=16, pady=12)
+
+    def ra_badges(self, items, gid):
+        def work():
+            d = CACHE / "ra_badges"; d.mkdir(parents=True, exist_ok=True)
+            for iid, badge, earned in items:
+                name = badge + ("" if earned else "_lock"); f = d / f"{name}.png"
+                try:
+                    if not f.exists():
+                        with http_get(f"https://media.retroachievements.org/Badge/{name}.png") as r, open(f, "wb") as fh:
+                            fh.write(r.read())
+                    if self.ra_cur == gid: self.msgs.put(("ra", "badge", (iid, str(f)), None))
+                except Exception as ex:
+                    f.unlink(missing_ok=True); log(f"ra badge {name}: {ex!r}")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- music tab ----------------------------------------------------------------------------------
+    def build_music(self, center):
+        a = self.panel(center, "MUSIC // LAUNCHER AUDIO PLAYER"); self.tab_frames["MUSIC"] = a
+        if not self.mus:
+            tk.Label(a, text="The audio player uses Windows' built-in audio engine and isn't available on this system.", bg=PANEL, fg=DIM, font=self.F(10)).pack(padx=16, pady=20)
+            return
+        lcd = tk.Frame(a, bg=BG, highlightthickness=1, highlightbackground=LINE); lcd.pack(fill="x", padx=10, pady=(0, 6))
+        self.lcd_title = tk.Label(lcd, text="NO TRACK LOADED", bg=BG, fg=ORANGE, font=self.F(14, True), anchor="w"); self.lcd_title.pack(fill="x", padx=12, pady=(8, 0))
+        self.lcd_time = tk.Label(lcd, text="00:00 / 00:00", bg=BG, fg=CYAN, font=self.F(11, True), anchor="w"); self.lcd_time.pack(fill="x", padx=12)
+        self.viz = tk.Canvas(lcd, height=px(56), bg=BG, highlightthickness=0); self.viz.pack(fill="x", padx=12, pady=6)
+        self.seekbar = tk.Canvas(lcd, height=px(12), bg=PANEL2, highlightthickness=0, cursor="hand2"); self.seekbar.pack(fill="x", padx=12, pady=(0, 10))
+        self.seekbar.bind("<Button-1>", self.music_seek)
+        ctl = tk.Frame(a, bg=PANEL); ctl.pack(fill="x", padx=10, pady=4)
+        self.button(ctl, "\u25c0\u25c0 PREV", self.music_prev).pack(side="left", padx=(0, 4))
+        self.btn_play = self.button(ctl, "\u25b6 PLAY", self.music_toggle, accent=True); self.btn_play.pack(side="left", padx=4)
+        self.button(ctl, "\u25a0 STOP", self.music_stop).pack(side="left", padx=4)
+        self.button(ctl, "NEXT \u25b6\u25b6", lambda: self.music_next(False)).pack(side="left", padx=4)
+        self.btn_loop = self.button(ctl, "", self.music_cycle_loop); self.btn_loop.pack(side="left", padx=(14, 4))
+        self.btn_shuf = self.button(ctl, "", self.music_toggle_shuffle); self.btn_shuf.pack(side="left", padx=4)
+        tk.Label(ctl, text="VOL", bg=PANEL, fg=DIM, font=self.F(8, True)).pack(side="left", padx=(14, 2))
+        self.vol = tk.IntVar(value=self.cfg.get("music_vol", 70))
+        tk.Scale(ctl, from_=0, to=100, orient="horizontal", variable=self.vol, showvalue=0, length=px(120), bg=PANEL, fg=TEXT,
+                 troughcolor=PANEL2, highlightthickness=0, bd=0, activebackground=ORANGE, command=self.music_volume).pack(side="left")
+        self.music_paint_toggles()
+        lst = tk.Frame(a, bg=PANEL); lst.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+        self.music_tree = ttk.Treeview(lst, columns=("type",), show="tree headings", style="AC.Treeview", selectmode="extended")
+        self.music_tree.heading("#0", text="PLAYLIST"); self.music_tree.heading("type", text="TYPE")
+        self.music_tree.column("#0", width=px(560)); self.music_tree.column("type", width=px(70), anchor="center")
+        sb = ttk.Scrollbar(lst, orient="vertical", command=self.music_tree.yview, style="AC.Vertical.TScrollbar")
+        self.music_tree.configure(yscrollcommand=sb.set)
+        self.music_tree.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        self.music_tree.bind("<Double-1>", lambda e: self.music_play_selected())
+        foot = tk.Frame(a, bg=PANEL); foot.pack(fill="x", padx=10, pady=(0, 10))
+        self.button(foot, "+ ADD FILES", self.music_add_files).pack(side="left", padx=(0, 4))
+        self.button(foot, "+ ADD FOLDER", self.music_add_folder).pack(side="left", padx=4)
+        self.button(foot, "REMOVE", self.music_remove).pack(side="left", padx=4)
+        self.button(foot, "CLEAR", self.music_clear).pack(side="left", padx=4)
+        self.copy_var = tk.BooleanVar(value=self.cfg.get("music_copy", True))
+        tk.Checkbutton(foot, text=" COPY INTO LAUNCHER", variable=self.copy_var, command=lambda: self.set_opt("music_copy", self.copy_var.get()),
+                       bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL, activeforeground=CYAN, font=self.F(8, True),
+                       highlightthickness=0, bd=0).pack(side="right")
+        self.music_refresh_list()
+
+    def music_paint_toggles(self):
+        self.btn_loop.config(text="LOOP: " + ("OFF", "ALL", "ONE")[self.mus_loop])
+        self.btn_shuf.config(text="SHUFFLE: " + ("ON" if self.mus_shuffle else "OFF"))
+
+    def music_refresh_list(self):
+        self.music_tree.delete(*self.music_tree.get_children())
+        for i, p in enumerate(self.music):
+            mark = "\u25b6 " if i == self.mus_idx and self.mus_state != "stopped" else ""
+            self.music_tree.insert("", "end", iid=str(i), text=f"{mark}{i + 1:02d}  {Path(p).stem}", values=(Path(p).suffix[1:].upper(),))
+
+    def music_add(self, paths):
+        added = 0
+        for p in paths:
+            src = Path(p)
+            if src.suffix.lower() not in AUDIO_EXTS or not src.is_file(): continue
+            if self.copy_var.get() and src.resolve().parent != MUSIC_DIR.resolve():
+                MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+                dest = MUSIC_DIR / src.name
+                if not dest.exists() or dest.stat().st_size != src.stat().st_size:
+                    i = 1
+                    while dest.exists(): dest = MUSIC_DIR / f"{src.stem} ({i}){src.suffix}"; i += 1
+                    shutil.copy2(src, dest)
+                src = dest
+            if str(src) not in self.music: self.music.append(str(src)); added += 1
+        self.cfg["playlist"] = self.music; save_cfg(self.cfg); self.music_refresh_list()
+        self.typewrite(f"{added} TRACK(S) ADDED", 0)
+
+    def music_add_files(self):
+        exts = " ".join("*" + e for e in sorted(AUDIO_EXTS))
+        self.music_add(filedialog.askopenfilenames(title="Choose music files", filetypes=[("Audio", exts), ("All files", "*.*")]))
+
+    def music_add_folder(self):
+        d = filedialog.askdirectory(title="Choose a folder of music")
+        if d: self.music_add(sorted(str(f) for f in Path(d).rglob("*") if f.suffix.lower() in AUDIO_EXTS))
+
+    def music_remove(self):
+        gone = {int(i) for i in self.music_tree.selection()}
+        if not gone: return
+        cur = self.music[self.mus_idx] if 0 <= self.mus_idx < len(self.music) else None
+        self.music = [p for i, p in enumerate(self.music) if i not in gone]
+        self.mus_idx = self.music.index(cur) if cur in self.music else -1
+        if cur is None or self.mus_idx < 0: self.music_stop()
+        self.cfg["playlist"] = self.music; save_cfg(self.cfg); self.music_refresh_list()
+
+    def music_clear(self):
+        self.music_stop(); self.music = []; self.mus_idx = -1; self.cfg["playlist"] = []; save_cfg(self.cfg); self.music_refresh_list()
+
+    def music_play_selected(self):
+        sel = self.music_tree.selection()
+        if sel: self.music_play_index(int(sel[0]))
+
+    def music_play_index(self, i):
+        if not (0 <= i < len(self.music)): return
+        try:
+            self.mus.load(self.music[i]); self.mus.volume(self.vol.get()); self.mus.play()
+        except Exception as ex:
+            self.mus_state = "stopped"; self.btn_play.config(text="\u25b6 PLAY")
+            return self.typewrite(f"CAN'T PLAY {Path(self.music[i]).name}: {ex}"[:100], 0)
+        self.mus_idx, self.mus_state, self.mus_started = i, "playing", time.time()
+        try: self.mus_len = self.mus.length()
+        except Exception: self.mus_len = 0
+        self.mus_hist.append(i)
+        self.lcd_title.config(text=Path(self.music[i]).stem.upper()[:60])
+        self.btn_play.config(text="\u275a\u275a PAUSE"); self.music_refresh_list()
+
+    def music_toggle(self):
+        if self.mus_state == "playing":
+            self.mus.pause(); self.mus_state = "paused"; self.btn_play.config(text="\u25b6 PLAY")
+        elif self.mus_state == "paused":
+            self.mus.resume(); self.mus_state = "playing"; self.btn_play.config(text="\u275a\u275a PAUSE")
+        else:
+            sel = self.music_tree.selection()
+            self.music_play_index(int(sel[0]) if sel else (self.mus_idx if self.mus_idx >= 0 else 0))
+
+    def music_stop(self):
+        if not self.mus: return
+        try:
+            if self.mus.is_open: self.mus.stop()
+        except Exception: pass
+        self.mus_state = "stopped"; self.mus_count = 0
+        if hasattr(self, "btn_play"): self.btn_play.config(text="\u25b6 PLAY"); self.music_refresh_list()
+
+    def music_next(self, auto=False):
+        if auto: self.mus_count += 1
+        else: self.mus_count = 0
+        i = next_track(self.mus_idx, len(self.music), self.mus_loop, self.mus_shuffle, auto, self.mus_count)
+        if i is None: return self.music_stop()
+        self.music_play_index(i)
+
+    def music_prev(self):
+        try:
+            if self.mus_state != "stopped" and self.mus.pos() > 3000: return self.music_play_index(self.mus_idx)
+        except Exception: pass
+        if len(self.mus_hist) > 1:
+            self.mus_hist.pop(); self.music_play_index(self.mus_hist.pop())
+        elif self.music:
+            self.music_play_index((self.mus_idx - 1) % len(self.music))
+
+    def music_cycle_loop(self):
+        self.mus_loop = (self.mus_loop + 1) % 3; self.cfg["music_loop"] = self.mus_loop; save_cfg(self.cfg); self.music_paint_toggles()
+
+    def music_toggle_shuffle(self):
+        self.mus_shuffle = not self.mus_shuffle; self.cfg["music_shuffle"] = self.mus_shuffle; save_cfg(self.cfg); self.music_paint_toggles()
+
+    def music_volume(self, v):
+        self.cfg["music_vol"] = int(float(v))
+        if self.mus and self.mus.is_open: self.mus.volume(int(float(v)))
+
+    def music_seek(self, e):
+        if self.mus_state not in ("playing", "paused") or self.mus_len <= 0: return
+        try:
+            self.mus.seek(e.x / max(1, self.seekbar.winfo_width()) * self.mus_len)
+            self.mus_state = "playing"; self.btn_play.config(text="\u275a\u275a PAUSE")
+        except Exception: pass
+
+    def music_suspend(self):   # quiet the player while a game runs
+        if self.mus and self.mus_state == "playing":
+            try: self.mus.pause(); self.mus_state = "paused"; self.mus_was_playing = True
+            except Exception: pass
+
+    def music_resume(self):
+        if self.mus and self.mus_was_playing and self.mus_state == "paused":
+            try: self.mus.resume(); self.mus_state = "playing"
+            except Exception: pass
+        self.mus_was_playing = False
+
+    def music_tick(self):
+        if self.mus and hasattr(self, "viz"):
+            try:
+                if self.mus_state == "playing":
+                    if time.time() - self.mus_started > 1.0 and self.mus.mode() == "stopped":
+                        self.music_next(auto=True)
+                    else:
+                        pos = self.mus.pos(); self.mus_len = self.mus_len or self.mus.length()
+                        self.lcd_time.config(text=f"{fmt_ms(pos)} / {fmt_ms(self.mus_len)}")
+                        if self.cur_tab == "MUSIC":
+                            w, h = self.seekbar.winfo_width(), self.seekbar.winfo_height()
+                            self.seekbar.delete("all")
+                            self.seekbar.create_rectangle(0, 0, w * pos / max(1, self.mus_len), h, fill=ORANGE, outline="")
+            except Exception:
+                pass
+            if self.cur_tab == "MUSIC": self.draw_viz()
+        self.after(150, self.music_tick)
+
+    def draw_viz(self):   # decorative equaliser bars (not a real spectrum analyser)
+        c = self.viz; c.delete("all"); w, h = c.winfo_width(), c.winfo_height()
+        n = len(self.viz_h); bw = max(3, w // n)
+        for i in range(n):
+            target = random.random() ** 0.7 if self.mus_state == "playing" else 0.04
+            self.viz_h[i] = self.viz_h[i] * 0.55 + target * 0.45
+            bh = max(2, int(self.viz_h[i] * (h - 4))); x = i * bw
+            c.create_rectangle(x + 1, h - bh, x + bw - 2, h, fill=ORANGE, outline="")
+            c.create_rectangle(x + 1, h - bh, x + bw - 2, h - bh + max(2, int(2 * SC)), fill=CYAN, outline="")
 
     def set_emulators(self):
         for sys_, em in EMULATORS.items():
@@ -2086,6 +2595,7 @@ class App(tk.Tk):
             self.restore_pending()
             return messagebox.showerror("Launch failed", str(ex))
         self.running = True; self.led.config(fg=ORANGE)
+        self.music_suspend()
         self.status.config(text=f"\u25b6 IN SORTIE: {e['title'].upper()}", fg=ORANGE)
         self.iconify()
         start = time.time()
@@ -2097,7 +2607,7 @@ class App(tk.Tk):
         e = self.cfg["library"][k]
         e["playtime"] += time.time() - start; e["last"] = time.time()
         self.restore_pending(); save_cfg(self.cfg); self.running = False
-        self.deiconify(); self.status.config(fg=TEXT); self.refresh()
+        self.deiconify(); self.status.config(fg=TEXT); self.refresh(); self.music_resume()
         self.typewrite("SORTIE COMPLETE ... WELCOME BACK, RAVEN", 0)
         if e["system"] == "PS3" and time.time() - start < 150:   # closed quickly: probably a problem
             self.after(500, lambda: self.diagnose_ps3(ask=True))

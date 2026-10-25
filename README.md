@@ -42,3 +42,5 @@ Armored Core and its artwork belong to FromSoftware / Bandai Namco. Unofficial f
 - Armored Core VI: Fires of Rubicon launches through Steam (auto-detected; LOCATE STEAM FOLDER in System Check). Lore, box art and screenshots included.
 - SOUNDTRACKS tab: composers, eras and the tracks fans name most often, with a YouTube search button.
 - Resolution defaults to AUTO (matches your display). Game settings are applied only while a game runs; your own emulator settings are restored when it closes.
+- ACHIEVEMENTS tab (RetroAchievements): shows your profile, progress and leaderboards for Armored Core sets on PS1/PS2/PSP. Needs your own RetroAchievements username and Web API key (kept only in the launcher's settings file). To earn achievements, enable RetroAchievements inside DuckStation, PCSX2 or PPSSPP.
+- MUSIC tab: built-in player (mp3, wav, wma, midi; flac/m4a/ogg depend on Windows codecs) with playlist, loop, shuffle, seek and volume. Pauses while a game runs.

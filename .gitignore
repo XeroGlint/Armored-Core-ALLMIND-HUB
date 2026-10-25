@@ -1,0 +1,15 @@
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# never commit game files, BIOS, firmware or keys
+*.iso
+*.bin
+*.cue
+*.chd
+*.pup
+*.PUP
+*.pkg

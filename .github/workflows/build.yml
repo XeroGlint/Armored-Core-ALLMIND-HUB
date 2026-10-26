@@ -1,22 +1,63 @@
 name: Build Windows app
+
+# Builds ArmoredCoreLauncher.exe on every commit pushed to any branch.
+#  - every build: downloadable from the run's "Artifacts" section
+#  - pushes to main: also refreshes a public "Latest build" release (tag: latest)
+#  - tags like v1.0: creates a normal versioned release
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
   workflow_dispatch:
+
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
+        with:
+          python-version: '3.12'
+          cache: pip
+
       - run: pip install -r requirements.txt
+
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py
+
       - uses: actions/upload-artifact@v4
-        with: { name: ArmoredCoreLauncher, path: dist/ArmoredCoreLauncher.exe }
-      - if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: ArmoredCoreLauncher-build${{ github.run_number }}
+          path: dist/ArmoredCoreLauncher.exe
+
+      - name: Move the "latest" tag to this commit
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Publish the rolling "Latest build" release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
-        with: { files: dist/ArmoredCoreLauncher.exe }
+        with:
+          tag_name: latest
+          name: Latest build (main)
+          prerelease: true
+          body: "Automatic build of the newest commit on main (${{ github.sha }}). Unsigned: Windows may show an unknown-publisher warning."
+          files: dist/ArmoredCoreLauncher.exe
+
+      - name: Publish a versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ArmoredCoreLauncher.exe

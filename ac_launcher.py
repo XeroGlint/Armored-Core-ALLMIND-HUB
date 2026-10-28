@@ -1026,6 +1026,61 @@ def fmt_ms(ms):
     return f"{ms // 60:02d}:{ms % 60:02d}"
 
 
+# ---- controller navigation (XInput: Xbox pads, or DualShock/DualSense via Steam Input / DS4Windows) -------
+NATIVE_DEPTH = [0]   # >0 while a Windows pop-up (message box / file picker) is open
+
+
+def _native(fn):
+    def wrapper(*a, **k):
+        NATIVE_DEPTH[0] += 1
+        try: return fn(*a, **k)
+        finally: NATIVE_DEPTH[0] -= 1
+    return wrapper
+
+
+for _mod, _names in ((messagebox, ("showinfo", "showwarning", "showerror", "askyesno", "askyesnocancel", "askokcancel", "askretrycancel", "askquestion")),
+                     (filedialog, ("askopenfilename", "askopenfilenames", "askdirectory", "asksaveasfilename"))):
+    for _n in _names:
+        if hasattr(_mod, _n): setattr(_mod, _n, _native(getattr(_mod, _n)))
+
+
+def xinput_raw():
+    """(buttons, left trigger, right trigger, left stick x, left stick y) of the first connected pad, or None."""
+    if os.name != "nt": return None
+    if "lib" not in _XI: xinput_pads()   # loads the XInput library once
+    lib, STATE = _XI.get("lib"), _XI.get("STATE")
+    if not lib: return None
+    import ctypes
+    for i in range(4):
+        st = STATE()
+        if lib.XInputGetState(i, ctypes.byref(st)) == 0:
+            g = st.pad
+            return g.wButtons, g.lt, g.rt, g.lx, g.ly
+    return None
+
+
+def pad_pick(cur, items, dx, dy):
+    """Spatial navigation: from centre cur=(x, y) choose the nearest item centre in direction (dx, dy)."""
+    best, bs = None, None
+    for key, (x, y) in items:
+        ddx, ddy = x - cur[0], y - cur[1]
+        if (dx > 0 and ddx <= 4) or (dx < 0 and ddx >= -4) or (dy > 0 and ddy <= 4) or (dy < 0 and ddy >= -4):
+            continue
+        along, across = (abs(ddx), abs(ddy)) if dx else (abs(ddy), abs(ddx))
+        sc = along + 2.5 * across
+        if bs is None or sc < bs: best, bs = key, sc
+    return best
+
+
+def pad_dedupe(items, tol=3):
+    """Drop widgets that sit entirely inside a larger clickable widget (keeps one cursor stop per button)."""
+    inside = lambda a, b: a[0] >= b[0] - tol and a[1] >= b[1] - tol and a[0] + a[2] <= b[0] + b[2] + tol and a[1] + a[3] <= b[1] + b[3] + tol
+    kept = []
+    for key, r in sorted(items, key=lambda kv: -kv[1][2] * kv[1][3]):
+        if not any(inside(r, kr) for _, kr in kept): kept.append((key, r))
+    return [k for k, _ in kept]
+
+
 def norm(s): return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
@@ -1087,6 +1142,9 @@ class App(tk.Tk):
             if w_ >= px(900) and h_ >= px(600) and -50 <= x_ < sw - 100 and -50 <= y_ < sh - 100:
                 self.geometry(g)
         self.bios_warned = set()
+        self.pad_cur, self.pad_saved, self.pad_root_prev = None, None, None
+        self.pad_prev_btn, self.pad_lt, self.pad_rt, self.pad_dir, self.pad_dir_t = 0, False, False, (0, 0), 0.0
+        self.pad_present, self.pad_idle = False, 0
         self.filter = "ALL"
         self.running = False
         self.installing = False
@@ -1111,6 +1169,7 @@ class App(tk.Tk):
         self.typewrite("AC SYSTEM BOOT ... ALL SYSTEMS NOMINAL", 0)
         self.anim()
         self.music_tick()
+        self.pad_tick()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(700, self.startup)
 
@@ -1239,6 +1298,7 @@ class App(tk.Tk):
         self.np.bind("<Button-1>", lambda e: self.music_toggle() if self.mus else None)
         self.update_lbl = tk.Label(sbar, text="\u2b06 NEW LAUNCHER BUILD AVAILABLE", bg=PANEL2, fg=WARN, font=self.F(9, True), cursor="hand2")
         self.update_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://github.com/{REPO}/releases/tag/latest"))
+        self.pad_hint = tk.Label(sbar, text="\u25ce CONTROLLER READY", bg=PANEL2, fg=CYAN, font=self.F(9, True))
         self.set_filter("ALL")
         self.show_tab("LIBRARY")
         self.tree.bind("<Return>", lambda e: self.play())
@@ -2078,6 +2138,15 @@ class App(tk.Tk):
         tk.Label(d, text="Note: RPCS3's Player 1 defaults to the keyboard, so for a controller switch the Handler in Configuration > Pads. "
                          "Controls are saved by each emulator and used for every game on that console.",
                  bg=PANEL, fg=TEXT, font=self.F(8), wraplength=px(720), justify="left").pack(anchor="w", padx=16, pady=6)
+        nav = tk.Frame(d, bg=PANEL2, highlightthickness=1, highlightbackground=LINE); nav.pack(fill="x", padx=16, pady=4)
+        nv = tk.BooleanVar(value=self.cfg.get("pad_nav", True))
+        tk.Checkbutton(nav, text=" USE MY CONTROLLER TO NAVIGATE THIS LAUNCHER", variable=nv, command=lambda: self.set_opt("pad_nav", nv.get()),
+                       bg=PANEL2, fg=TEXT, selectcolor=BG, activebackground=PANEL2, activeforeground=CYAN, font=self.F(9, True),
+                       highlightthickness=0, bd=0, anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(nav, text="D-pad / left stick: move   A: select   B: back or close a window   LB / RB: switch tabs   BACK: system check\n"
+                           "Library: LT / RT change platform, X settings, Y favorite, START sortie.   Music: LT / RT previous / next, X stop, Y shuffle, START play / pause.\n"
+                           "Windows pop-ups (message boxes, file pickers) take D-pad, A and B too, but may not respond on every system.",
+                 bg=PANEL2, fg=DIM, font=self.F(8), wraplength=px(700), justify="left").pack(anchor="w", padx=10, pady=(0, 8))
         self.button(d, "CLOSE", d.destroy).pack(side="bottom", anchor="e", padx=16, pady=12)
 
     # ---- RPCS3 log diagnosis window ----------------------------------------------------------
@@ -2750,6 +2819,182 @@ class App(tk.Tk):
         if newer:
             self.update_lbl.pack(side="right", padx=10)
             self.typewrite("A NEWER LAUNCHER BUILD IS AVAILABLE - CLICK THE ORANGE NOTICE", 0)
+
+    # ---- controller navigation ---------------------------------------------------------------
+    def pad_tick(self):
+        try: self.pad_poll()
+        except Exception as ex: log(f"pad: {ex!r}")
+        self.after(45, self.pad_tick)
+
+    def pad_poll(self):
+        if os.name != "nt" or not self.cfg.get("pad_nav", True): return
+        if not self.pad_present:
+            self.pad_idle += 1
+            if self.pad_idle % 20: return          # look for a pad about once a second
+        st = xinput_raw()
+        if st is None:
+            if self.pad_present:
+                self.pad_present = False; self.pad_hint.pack_forget(); self.pad_clear(); self.pad_cur = None
+            return
+        if not self.pad_present:
+            self.pad_present = True; self.pad_hint.pack(side="right", padx=10)
+            self.typewrite("CONTROLLER CONNECTED - D-PAD TO MOVE, A TO SELECT", 0)
+        btn, lt, rt, lx, ly = st; now = time.time()
+        pressed = btn & ~self.pad_prev_btn; self.pad_prev_btn = btn
+        trig_l, trig_r = lt > 150 and not self.pad_lt, rt > 150 and not self.pad_rt
+        self.pad_lt, self.pad_rt = lt > 150, rt > 150
+        dx = 1 if btn & 0x8 else -1 if btn & 0x4 else 0
+        dy = 1 if btn & 0x2 else -1 if btn & 0x1 else 0
+        if not dx and not dy:                      # left stick, strongest axis wins
+            if abs(lx) >= abs(ly) and abs(lx) > 16000: dx = 1 if lx > 0 else -1
+            elif abs(ly) > 16000: dy = -1 if ly > 0 else 1
+        fire = False
+        if (dx, dy) != (0, 0):
+            if (dx, dy) != self.pad_dir: self.pad_dir, self.pad_dir_t, fire = (dx, dy), now + 0.35, True
+            elif now >= self.pad_dir_t: self.pad_dir_t, fire = now + 0.11, True
+        else:
+            self.pad_dir = (0, 0)
+        if NATIVE_DEPTH[0] > 0:
+            return self.pad_native(pressed, fire, dx, dy)
+        try:
+            if self.running or self.state() == "iconic" or self.focus_displayof() is None: return
+        except Exception:
+            return
+        root = self.pad_root()
+        if root is not self.pad_root_prev:
+            self.pad_root_prev = root; self.pad_clear(); self.pad_cur = None
+        if fire: self.pad_move(dx, dy, root)
+        if pressed & 0x1000: self.pad_activate(root)
+        elif pressed & 0x2000: self.pad_back(root)
+        elif root is self: self.pad_shortcuts(pressed, trig_l, trig_r)
+
+    def pad_native(self, pressed, fire, dx, dy):   # Windows pop-ups: send the matching key presses
+        import ctypes
+        def key(vk):
+            ctypes.windll.user32.keybd_event(vk, 0, 0, 0); ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+        if pressed & 0x1000: key(0x0D)
+        elif pressed & 0x2000: key(0x1B)
+        elif fire: key({(1, 0): 0x27, (-1, 0): 0x25, (0, 1): 0x28, (0, -1): 0x26}.get((dx, dy), 0x09))
+
+    def pad_root(self):
+        g = self.grab_current()
+        if g is not None: return g.winfo_toplevel()
+        tops = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_viewable()]
+        return tops[-1] if tops else self
+
+    def pad_cands(self, root):
+        items = []
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, tk.Toplevel): continue
+                try: vis = c.winfo_viewable() and c.winfo_width() > 6 and c.winfo_height() > 6
+                except tk.TclError: continue
+                if not vis: continue
+                if isinstance(c, (ttk.Treeview, tk.Scale, tk.Checkbutton, tk.Button, ttk.Button)) or \
+                        (isinstance(c, (tk.Label, tk.Frame)) and c.bind("<Button-1>")):
+                    items.append((c, (c.winfo_rootx(), c.winfo_rooty(), c.winfo_width(), c.winfo_height())))
+                walk(c)
+        walk(root)
+        return pad_dedupe(items)
+
+    def pad_primary(self):
+        name = {"LIBRARY": "tree", "ARCHIVE": "lore_tree", "SOUNDTRACKS": "ost_tree",
+                "MUSIC": "music_tree", "ACHIEVEMENTS": "ra_games_tree"}.get(self.cur_tab)
+        return getattr(self, name, None) if name else None
+
+    def pad_default(self, root, cands):
+        if root is self:
+            prim = self.pad_primary()
+            if prim in cands: return prim
+        return min(cands, key=lambda w: (w.winfo_rooty(), w.winfo_rootx()))
+
+    def pad_clear(self):
+        if self.pad_saved:
+            w, opts = self.pad_saved
+            try:
+                if w.winfo_exists(): w.configure(**opts)
+            except tk.TclError: pass
+        self.pad_saved = None
+
+    def pad_set(self, w):
+        self.pad_clear(); self.pad_cur = w
+        tgt = w
+        try: w.cget("highlightthickness")
+        except Exception: tgt = w.master        # ttk widgets: ring their container instead
+        try:
+            self.pad_saved = (tgt, {o: tgt.cget(o) for o in ("highlightthickness", "highlightbackground", "highlightcolor")})
+            tgt.configure(highlightthickness=3, highlightbackground=CYAN, highlightcolor=CYAN)
+        except Exception:
+            self.pad_saved = None
+
+    def pad_tree_step(self, tree, dy):
+        kids = tree.get_children("")
+        if not kids: return False
+        sel = tree.selection(); i = kids.index(sel[0]) if sel and sel[0] in kids else -1
+        j = i + dy
+        if j < 0 or j >= len(kids): return False      # at the end of the list: let the cursor leave it
+        tree.selection_set(kids[j]); tree.focus(kids[j]); tree.see(kids[j])
+        return True
+
+    def pad_move(self, dx, dy, root):
+        cands = self.pad_cands(root)
+        if not cands: return
+        cur = self.pad_cur if self.pad_cur in cands else None
+        if cur is None: return self.pad_set(self.pad_default(root, cands))
+        if isinstance(cur, tk.Scale) and dx:
+            return cur.set(cur.get() + 5 * dx)
+        if isinstance(cur, ttk.Treeview) and dy and self.pad_tree_step(cur, dy): return
+        ctr = lambda w: (w.winfo_rootx() + w.winfo_width() / 2, w.winfo_rooty() + w.winfo_height() / 2)
+        nxt = pad_pick(ctr(cur), [(w, ctr(w)) for w in cands if w is not cur], dx, dy)
+        if nxt is not None: self.pad_set(nxt)
+
+    def pad_activate(self, root):
+        cands = self.pad_cands(root)
+        if not cands: return
+        w = self.pad_cur if self.pad_cur in cands else None
+        if w is None: return self.pad_set(self.pad_default(root, cands))
+        acts = {"tree": self.play, "music_tree": getattr(self, "music_play_selected", None), "ost_tree": self.open_track,
+                "lore_tree": lambda: self.open_url("wiki"), "ra_games_tree": self.ra_pick, "ra_lb": self.ra_open_board}
+        for name, fn in acts.items():
+            if fn and w is getattr(self, name, None): return fn()
+        if isinstance(w, (tk.Checkbutton, tk.Button, ttk.Button)): return w.invoke()
+        if isinstance(w, (ttk.Treeview, tk.Scale)): return
+        w.event_generate("<Button-1>", x=max(1, w.winfo_width() // 2), y=max(1, w.winfo_height() // 2))
+
+    def pad_back(self, root):
+        if root is not self:
+            self.pad_cur = None; return root.destroy()
+        if self.cur_tab != "LIBRARY": return self.pad_tab_to("LIBRARY")
+        if self.q.get(): self.q.set("")
+
+    def pad_tab_to(self, name):
+        self.show_tab(name); self.pad_clear(); self.pad_cur = None
+        self.after(60, self.pad_focus_primary)
+
+    def pad_focus_primary(self):
+        cands = self.pad_cands(self)
+        if cands: self.pad_set(self.pad_default(self, cands))
+
+    def pad_shortcuts(self, pressed, trig_l, trig_r):
+        order = ["LIBRARY", "ARCHIVE", "SOUNDTRACKS", "MUSIC", "ACHIEVEMENTS"]
+        if pressed & 0x100: return self.pad_tab_to(order[(order.index(self.cur_tab) - 1) % len(order)])
+        if pressed & 0x200: return self.pad_tab_to(order[(order.index(self.cur_tab) + 1) % len(order)])
+        if pressed & 0x20: return self.system_check()
+        if self.cur_tab == "LIBRARY":
+            if trig_l or trig_r: self.cycle_filter(-1 if trig_l else 1)
+            elif pressed & 0x4000: self.game_settings()
+            elif pressed & 0x8000: self.toggle_fav()
+            elif pressed & 0x10: self.play()
+        elif self.cur_tab == "MUSIC" and self.mus:
+            if trig_l: self.music_prev()
+            elif trig_r: self.music_next(False)
+            elif pressed & 0x4000: self.music_stop()
+            elif pressed & 0x8000: self.music_toggle_shuffle()
+            elif pressed & 0x10: self.music_toggle()
+
+    def cycle_filter(self, step):
+        order = ["ALL", "FAV", "PS1", "PS2", "PSP", "PS3", "PC"]
+        self.set_filter(order[(order.index(self.filter) + step) % len(order)])
 
     def set_emulators(self):
         for sys_, em in EMULATORS.items():

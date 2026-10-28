@@ -5,7 +5,7 @@ It downloads and manages the official emulators (DuckStation, PCSX2, PPSSPP, RPC
 shows cover art and lore, and launches games with one click.
 
 ## Download (for players)
-Go to the Releases page and download ArmoredCoreLauncher.exe. No Python needed. Windows may show a SmartScreen "unknown publisher" warning because the app is unsigned: choose More info > Run anyway.
+Go to the Releases page. "Latest build (main)" is rebuilt automatically on every commit; versioned releases (v1.0, ...) are stable. Download ArmoredCoreLauncher.exe from either. No Python needed. Windows may show a SmartScreen "unknown publisher" warning because the app is unsigned: choose More info > Run anyway.
 
 ## Build the .exe (Windows)
 Option A - local: install Python 3.13 or 3.12 from python.org (avoid brand-new versions like 3.15) (tick "Add to PATH"), then double-click `build.bat`.
@@ -44,3 +44,11 @@ Armored Core and its artwork belong to FromSoftware / Bandai Namco. Unofficial f
 - Resolution defaults to AUTO (matches your display). Game settings are applied only while a game runs; your own emulator settings are restored when it closes.
 - ACHIEVEMENTS tab (RetroAchievements): shows your profile, progress and leaderboards for Armored Core sets on PS1/PS2/PSP. Needs your own RetroAchievements username and Web API key (kept only in the launcher's settings file). To earn achievements, enable RetroAchievements inside DuckStation, PCSX2 or PPSSPP.
 - MUSIC tab: built-in player (mp3, wav, wma, midi; flac/m4a/ogg depend on Windows codecs) with playlist, loop, shuffle, seek and volume. Pauses while a game runs.
+
+## Support
+If this launcher is useful, you can support its development on Ko-fi: https://ko-fi.com/crimzarkin
+
+## More features
+- 8 themes (WHITE GLINT, NEXT, RUBICON, CORAL, ARQUEBUS, BALAM, TERMINAL, NIGHTFALL): SYSTEM CHECK > THEMES.
+- Library: sort (release / recent / most played / name), right-click menu, ADD GAME MANUALLY for oddly named files, hide games, desktop shortcuts that launch a game directly (`ArmoredCoreLauncher.exe --play "Armored Core 3"`), library and playtime totals, and a "new build available" notice.
+- Safety: automatic save backup after each sortie (newest 10 kept per console), a BIOS/firmware check before launch, COPY SUPPORT INFO for bug reports.

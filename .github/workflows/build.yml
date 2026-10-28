@@ -30,6 +30,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Stamp the build with the commit hash
+        run: python .github/stamp.py
+
       - run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py
 
       - uses: actions/upload-artifact@v4

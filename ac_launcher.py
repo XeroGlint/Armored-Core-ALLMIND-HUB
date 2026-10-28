@@ -9,7 +9,7 @@ Data: ~/.ac_launcher/config.json
 """
 import json, os, queue, re, shutil, subprocess, sys, threading, time, zipfile
 import html as htmllib
-import hashlib, math, random, ssl, struct
+import hashlib, math, platform, random, ssl, struct
 import urllib.error
 import xml.etree.ElementTree as ET
 import urllib.parse, urllib.request
@@ -37,6 +37,9 @@ def px(n):
     return int(round(n * SC))
 
 CFG_PATH = Path.home() / ".ac_launcher" / "config.json"
+KOFI_URL = "https://ko-fi.com/crimzarkin"
+REPO = "XeroGlint/Armored-Core-ALLMIND-HUB"
+BUILD_ID = "dev"   # stamped with the commit hash by the GitHub build
 
 # ---- themes. WHITE GLINT = pale steel + ice-blue glow; NEXT = dark gunmetal + warning orange.
 # (The primary accent colour variable is called ORANGE for historical reasons.)
@@ -50,6 +53,32 @@ THEMES = {
                  ACC_FG="#000000", HOV="#1d2a33", HOV_FG="#ffffff", ACC_HOV="#ffa05a",
                  SCAN="#10171c", LED_DIM="#2e5360", GLINT="#8fd8ee"),
 }
+THEMES.update({
+    # AC6-style: stark black and white with amber
+    "RUBICON": dict(BG="#050505", PANEL="#0d0d0d", PANEL2="#171717", LINE="#3a3a3a", CYAN="#f2f2f2", TEXT="#d9d9d9",
+                    DIM="#7a7a7a", ORANGE="#ffb000", RED="#ff4a3a", WARN="#ffb000", ACC_FG="#000000", HOV="#262626",
+                    HOV_FG="#ffffff", ACC_HOV="#ffd060", SCAN="#111111", LED_DIM="#6b5200", GLINT="#ffb000"),
+    # deep red glow on near-black
+    "CORAL": dict(BG="#0a0506", PANEL="#150a0c", PANEL2="#1f1013", LINE="#4a1f26", CYAN="#ff8a9a", TEXT="#ecd6d9",
+                  DIM="#8a5a62", ORANGE="#ff2e57", RED="#ff5a3a", WARN="#ff9a2e", ACC_FG="#000000", HOV="#2a141a",
+                  HOV_FG="#ffffff", ACC_HOV="#ff6b88", SCAN="#1a0c0f", LED_DIM="#5a1a28", GLINT="#ff2e57"),
+    # cool corporate steel blue
+    "ARQUEBUS": dict(BG="#0b1118", PANEL="#121b25", PANEL2="#192530", LINE="#2f4558", CYAN="#9cc9f0", TEXT="#d3e0ec",
+                     DIM="#678199", ORANGE="#4aa3ff", RED="#ff5b4a", WARN="#ffb347", ACC_FG="#04121f", HOV="#223445",
+                     HOV_FG="#ffffff", ACC_HOV="#7fbcff", SCAN="#0f1821", LED_DIM="#244766", GLINT="#9cc9f0"),
+    # industrial amber and olive-brown
+    "BALAM": dict(BG="#0e0c08", PANEL="#16130d", PANEL2="#1e1a11", LINE="#4a4125", CYAN="#e0c97a", TEXT="#e3dcc6",
+                  DIM="#8a7f5c", ORANGE="#e8a317", RED="#d9482b", WARN="#e8a317", ACC_FG="#140f00", HOV="#2b2616",
+                  HOV_FG="#ffffff", ACC_HOV="#f5c24a", SCAN="#120f09", LED_DIM="#5a4a14", GLINT="#e0c97a"),
+    # green phosphor CRT
+    "TERMINAL": dict(BG="#020a04", PANEL="#06130a", PANEL2="#0a1d10", LINE="#145a28", CYAN="#6dff9a", TEXT="#b8f5c9",
+                     DIM="#3f8f58", ORANGE="#2bff6a", RED="#ff5555", WARN="#e8ff2b", ACC_FG="#001a08", HOV="#0f2e18",
+                     HOV_FG="#eafff0", ACC_HOV="#7dffa3", SCAN="#041208", LED_DIM="#145a28", GLINT="#2bff6a"),
+    # true-black (OLED) with violet
+    "NIGHTFALL": dict(BG="#000000", PANEL="#08080c", PANEL2="#101018", LINE="#2a2a40", CYAN="#b9a8ff", TEXT="#e0e0f0",
+                      DIM="#6a6a8a", ORANGE="#8c6bff", RED="#ff5470", WARN="#ffb454", ACC_FG="#0a0520", HOV="#1c1c2c",
+                      HOV_FG="#ffffff", ACC_HOV="#a58cff", SCAN="#0c0c14", LED_DIM="#2e2660", GLINT="#b9a8ff"),
+})
 THEME_NAME = "WHITE GLINT"
 
 
@@ -1038,8 +1067,9 @@ def scan_folder(folder, system):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, autoplay=None):
         super().__init__()
+        self.autoplay = autoplay
         global SC
         SC = max(1.0, self.winfo_fpixels("1i") / 96)
         self.title("ARMORED CORE // LAUNCHER")
@@ -1050,6 +1080,13 @@ class App(tk.Tk):
         fams = set(tkfont.families())
         self.mono = next((f for f in ("Consolas", "Lucida Console", "DejaVu Sans Mono", "Courier New") if f in fams), "Courier")
         self.cfg = load_cfg()
+        g = self.cfg.get("geometry")   # remember window size and position
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", g or "")
+        if m:
+            w_, h_, x_, y_ = map(int, m.groups())
+            if w_ >= px(900) and h_ >= px(600) and -50 <= x_ < sw - 100 and -50 <= y_ < sh - 100:
+                self.geometry(g)
+        self.bios_warned = set()
         self.filter = "ALL"
         self.running = False
         self.installing = False
@@ -1121,11 +1158,12 @@ class App(tk.Tk):
         # left: system select + utilities
         left = self.panel(body, "SELECT PLATFORM"); left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         left.config(width=190)
+        self.button(left, "\u2665 SUPPORT ON KO-FI", lambda: webbrowser.open(KOFI_URL), accent=True).pack(side="bottom", fill="x", padx=10, pady=(0, 10))
         self.sys_btns = {}
         for key, sub in [("ALL", "ALL FRAMES"), ("FAV", "FAVORITES")] + [(k, v["name"]) for k, v in EMULATORS.items()] + [("PC", "STEAM")]:
             fr = tk.Frame(left, bg=PANEL, cursor="hand2"); fr.pack(fill="x", padx=8, pady=2)
             bar = tk.Frame(fr, bg=PANEL, width=4); bar.pack(side="left", fill="y")
-            t = tk.Label(fr, text={"FAV": "\u2605 FAVS"}.get(key, key), bg=PANEL, fg=TEXT, font=self.F(12, True), anchor="w", padx=8)
+            t = tk.Label(fr, text={"FAV": "\u2605 FAVS"}.get(key, key), bg=PANEL, fg=TEXT, font=self.F(11, True), anchor="w", padx=8)
             t.pack(fill="x")
             u = tk.Label(fr, text=sub.upper(), bg=PANEL, fg=DIM, font=self.F(8), anchor="w", padx=8)
             u.pack(fill="x")
@@ -1133,9 +1171,9 @@ class App(tk.Tk):
                 w.bind("<Button-1>", lambda e, k=key: self.set_filter(k))
             self.sys_btns[key] = (bar, t)
         tk.Frame(left, bg=LINE, height=1).pack(fill="x", padx=10, pady=10)
-        for txt, cmd in [("+ ADD FOLDER", self.add_folder), ("\u21bb RESCAN", self.rescan),
-                         ("\u2713 SYSTEM CHECK", self.system_check), ("\u2193 UPDATE EMULATORS", self.update_now),
-                         ("\u25ce CONTROLLERS", self.controllers_dialog), ("\u2716 RESET / UNINSTALL", self.reset_dialog)]:
+        for txt, cmd in [("+ ADD FOLDER", self.add_folder), ("+ ADD GAME MANUALLY", self.add_game_manual),
+                         ("\u21bb RESCAN", self.rescan), ("\u2713 SYSTEM CHECK", self.system_check),
+                         ("\u25ce CONTROLLERS", self.controllers_dialog)]:
             self.button(left, txt, cmd).pack(fill="x", padx=10, pady=3)
 
         # center: list
@@ -1153,6 +1191,7 @@ class App(tk.Tk):
                  font=self.F(10), highlightthickness=1, highlightbackground=LINE,
                  highlightcolor=ORANGE)
         self.search_entry.pack(side="left", fill="x", expand=True, padx=6, ipady=3)
+        self.sort_btn = self.button(sr, "", self.cycle_sort); self.sort_btn.pack(side="left"); self.paint_sort()
         wrap = tk.Frame(mid, bg=PANEL); wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         cols = ("no", "title", "sys", "time")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", style="AC.Treeview", selectmode="browse")
@@ -1195,9 +1234,15 @@ class App(tk.Tk):
         self.led = tk.Label(sbar, text="\u25cf", bg=PANEL2, fg=CYAN, font=self.F(10)); self.led.pack(side="left", padx=(10, 4))
         self.status = tk.Label(sbar, text="", bg=PANEL2, fg=TEXT, font=self.F(9)); self.status.pack(side="left")
         self.clock = tk.Label(sbar, text="", bg=PANEL2, fg=DIM, font=self.F(9)); self.clock.pack(side="right", padx=10)
+        self.stats = tk.Label(sbar, text="", bg=PANEL2, fg=DIM, font=self.F(9)); self.stats.pack(side="right", padx=10)
+        self.np = tk.Label(sbar, text="", bg=PANEL2, fg=ORANGE, font=self.F(9, True), cursor="hand2"); self.np.pack(side="right", padx=10)
+        self.np.bind("<Button-1>", lambda e: self.music_toggle() if self.mus else None)
+        self.update_lbl = tk.Label(sbar, text="\u2b06 NEW LAUNCHER BUILD AVAILABLE", bg=PANEL2, fg=WARN, font=self.F(9, True), cursor="hand2")
+        self.update_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://github.com/{REPO}/releases/tag/latest"))
         self.set_filter("ALL")
         self.show_tab("LIBRARY")
         self.tree.bind("<Return>", lambda e: self.play())
+        self.tree.bind("<Button-3>", self.tree_menu)
         self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
         self.bind("<Escape>", lambda e: self.focus_set())
 
@@ -1213,7 +1258,7 @@ class App(tk.Tk):
                       anchor="w", fill=CYAN, font=self.F(9, True))
         c.create_line(0, 50*k, 270*k, 50*k, fill=ORANGE, width=2)
         c.create_text(w - 14*k, 22*k, text=f"FRAME // {THEME_NAME}", anchor="e", fill=ORANGE, font=self.F(10, True))
-        c.create_text(w - 14*k, 38*k, text="ALL PILOTS: SORTIE READY", anchor="e", fill=DIM, font=self.F(8))
+        c.create_text(w - 14*k, 38*k, text=f"ALL PILOTS: SORTIE READY  //  BUILD {BUILD_ID[:7].upper()}", anchor="e", fill=DIM, font=self.F(8))
 
     def anim(self):  # light sweep across the header every few seconds
         c, k = self.header, SC
@@ -1269,11 +1314,16 @@ class App(tk.Tk):
 
     def rescan(self):
         old, best = self.cfg["library"], {}
+        hidden = set(self.cfg.get("hidden", []))
         for fo in self.cfg["folders"]:
             for path, title, order in scan_folder(fo["path"], fo["system"]):
+                if path in hidden: continue
                 rank = EXT_RANK.get(Path(path).suffix.lower(), 5)   # e.g. prefer .cue over its .bin
                 key = (fo["system"], title)
                 if key not in best or rank < best[key][0]: best[key] = (rank, path, order)
+        for path, meta in self.cfg.get("manual", {}).items():   # games you assigned by hand
+            if os.path.exists(path) and path not in hidden:
+                best[(meta["system"], meta["title"])] = (-1, path, meta["order"])
         lib = {}
         for (sys_, title), (_, path, order) in best.items():
             prev = old.get(path) or next((v for v in old.values() if v.get("title") == title and v.get("system") == sys_), {})
@@ -1288,7 +1338,7 @@ class App(tk.Tk):
             lib[key] = {"playtime": prev.get("playtime", 0), "last": prev.get("last", 0), "args": "", "title": AC6_TITLE,
                         "system": "PC", "order": 19, "dir": info["dir"], **({"fav": True} if prev.get("fav") else {})}
         for pth, v in old.items():   # keep entries from folders not scanned right now (e.g. unplugged drive)
-            if (v.get("system"), v.get("title")) not in best and os.path.exists(pth): lib.setdefault(pth, v)
+            if pth not in hidden and (v.get("system"), v.get("title")) not in best and os.path.exists(pth): lib.setdefault(pth, v)
         self.cfg["library"] = lib
         save_cfg(self.cfg); self.refresh()
         self.typewrite(f"SCAN COMPLETE ... {len(lib)} FRAME(S) REGISTERED", 0)
@@ -1299,7 +1349,7 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         q = norm(self.q.get())
         n = 0
-        for path, e in sorted(self.cfg["library"].items(), key=lambda kv: kv[1].get("order", 99)):
+        for path, e in sorted(self.cfg["library"].items(), key=self.sort_key()):
             if (self.filter == "FAV" and not e.get("fav")) or (self.filter not in ("ALL", "FAV") and e["system"] != self.filter) or (q and q not in norm(e["title"])):
                 continue
             n += 1
@@ -1309,6 +1359,7 @@ class App(tk.Tk):
         if keep and self.tree.exists(keep): self.tree.selection_set(keep)
         elif self.tree.get_children(): self.tree.selection_set(self.tree.get_children()[0])
         self.show_detail()
+        self.update_stats()
 
     def selected(self):
         if not hasattr(self, "tree"): return None
@@ -1514,6 +1565,8 @@ class App(tk.Tk):
                 elif m[0] == "err":
                     self.status.config(text=f"{EMULATORS[m[1]]['name'].upper()} INSTALL FAILED", fg=RED)
                     messagebox.showerror("Install failed", f"{EMULATORS[m[1]]['name']}: {m[2]}\n\nCheck your connection, or use SET PATH MANUALLY.")
+                elif m[0] == "appupd":
+                    self.on_appupd(m[1])
                 elif m[0] == "ra":
                     self.on_ra(m[1], m[2], m[3])
                 elif m[0] == "pkg":
@@ -1559,6 +1612,8 @@ class App(tk.Tk):
         if self.setup_needed() and not self.cfg.get("skip_wizard"):
             self.system_check()
         self.check_updates(True)
+        self.check_app_update()
+        if self.autoplay: self.after(900, self.run_autoplay)
 
     def bios_ok(self, s):
         exe = self.cfg["emulators"].get(s)
@@ -1582,7 +1637,7 @@ class App(tk.Tk):
             self.check_win.lift(); return self.refresh_check()
         w = self.check_win = tk.Toplevel(self, bg=PANEL, highlightthickness=1, highlightbackground=ORANGE)
         w.title("PRE-SORTIE SYSTEM CHECK"); w.transient(self)
-        w.geometry(f"{px(760)}x{px(640)}+{self.winfo_x() + px(100)}+{self.winfo_y() + px(40)}")
+        w.geometry(f"{px(780)}x{min(px(760), self.winfo_screenheight() - 80)}+{self.winfo_x() + px(90)}+{self.winfo_y() + px(20)}")
         tk.Label(w, text="\u25a0 PRE-SORTIE SYSTEM CHECK", bg=PANEL, fg=ORANGE, font=self.F(13, True)).pack(anchor="w", padx=16, pady=(14, 0))
         tk.Label(w, text="PS1/PS2 BIOS must be your own dump. PS3 firmware can be fetched from Sony's official link via RPCS3's own page.",
                  bg=PANEL, fg=DIM, font=self.F(9)).pack(anchor="w", padx=16, pady=(0, 8))
@@ -1590,7 +1645,8 @@ class App(tk.Tk):
         self.check_body = tk.Frame(w, bg=PANEL); self.check_body.pack(fill="both", expand=True, padx=16)
         for text, key, dflt in ((" AUTO-UPDATE EMULATORS AT STARTUP", "auto_update", True),
                                 (" DON'T SHOW THIS WINDOW AT STARTUP", "skip_wizard", False),
-                                (" COMPATIBILITY LAUNCH (turn on if an emulator reports a DLL error)", "cmd_launch", False)):
+                                (" COMPATIBILITY LAUNCH (turn on if an emulator reports a DLL error)", "cmd_launch", False),
+                                (" AUTO-BACKUP SAVES AFTER EACH SORTIE", "auto_backup", True)):
             v = tk.BooleanVar(value=self.cfg.get(key, dflt))
             tk.Checkbutton(foot, text=text, variable=v, command=lambda v=v, k=key: self.set_opt(k, v.get()),
                            bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL, activeforeground=CYAN,
@@ -1598,8 +1654,13 @@ class App(tk.Tk):
         btns = tk.Frame(foot, bg=PANEL); btns.pack(fill="x", pady=(8, 0))
         self.button(btns, "CHECK FOR UPDATES", lambda: self.check_updates(True)).pack(side="left")
         self.button(btns, "BACKUP SAVES", self.backup_saves).pack(side="left", padx=6)
-        self.button(btns, "THEME", self.switch_theme).pack(side="left")
+        self.button(btns, "THEMES", self.theme_dialog).pack(side="left")
         self.button(btns, "SET PATHS", self.set_emulators).pack(side="left", padx=6)
+        btns2 = tk.Frame(foot, bg=PANEL); btns2.pack(fill="x", pady=(6, 0))
+        self.button(btns2, "COPY SUPPORT INFO", self.copy_support).pack(side="left")
+        self.button(btns2, "RESTORE HIDDEN GAMES", self.unhide_all).pack(side="left", padx=6)
+        self.button(btns2, "RESET / UNINSTALL", self.reset_dialog).pack(side="left")
+        self.button(btns2, "\u2665 KO-FI", lambda: webbrowser.open(KOFI_URL)).pack(side="left", padx=6)
         self.button(btns, "CLOSE", w.destroy, accent=True).pack(side="right")
         self.refresh_check()
 
@@ -1656,22 +1717,25 @@ class App(tk.Tk):
         elif messagebox.askyesno("Emulator updates", f"Updates available: {names}\nDownload and install now? (Saves are kept.)"):
             self.install(ups)
 
-    def backup_saves(self):
-        dirs = SAVE_DIRS
+    def backup_saves(self, only=None, silent=False):
         out = EMU_HOME.parent / "backups"; out.mkdir(parents=True, exist_ok=True)
-        zp = out / f"saves_{time.strftime('%Y%m%d_%H%M%S')}.zip"; n = 0
+        tag = f"auto_{only}" if only else "saves"
+        zp = out / f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.zip"; n = 0
         with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-            for s, rels in dirs.items():
-                exe = self.cfg["emulators"].get(s)
+            for s_, rels in SAVE_DIRS.items():
+                if only and s_ != only: continue
+                exe = self.cfg["emulators"].get(s_)
                 if not exe: continue
                 for rel in rels:
                     d = Path(exe).parent / rel
                     for f in (d.rglob("*") if d.exists() else []):
-                        if f.is_file(): z.write(f, f"{s}/{rel}/{f.relative_to(d)}"); n += 1
-        if n:
-            messagebox.showinfo("Backup complete", f"{n} files saved to:\n{zp}")
-        else:
-            zp.unlink(missing_ok=True); messagebox.showinfo("Backup", "No save files found yet.")
+                        if f.is_file(): z.write(f, f"{s_}/{rel}/{f.relative_to(d)}"); n += 1
+        if not n: zp.unlink(missing_ok=True)
+        if only:   # keep the newest 10 automatic backups per console
+            for f in sorted(out.glob(f"auto_{only}_*.zip"))[:-10]: f.unlink(missing_ok=True)
+        if silent: return n
+        if n: messagebox.showinfo("Backup complete", f"{n} files saved to:\n{zp}")
+        else: messagebox.showinfo("Backup", "No save files found yet.")
 
     def toggle_fav(self):
         k = self.selected()
@@ -2159,6 +2223,7 @@ class App(tk.Tk):
     def on_close(self):
         try:
             if self.mus: self.mus.close()
+            self.cfg["geometry"] = self.geometry()
             save_cfg(self.cfg)
         finally:
             self.destroy()
@@ -2353,6 +2418,8 @@ class App(tk.Tk):
         self.music_tree.configure(yscrollcommand=sb.set)
         self.music_tree.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
         self.music_tree.bind("<Double-1>", lambda e: self.music_play_selected())
+        self.music_tree.bind("<space>", lambda e: (self.music_toggle(), "break")[1])
+        self.music_tree.bind("<Delete>", lambda e: self.music_remove())
         foot = tk.Frame(a, bg=PANEL); foot.pack(fill="x", padx=10, pady=(0, 10))
         self.button(foot, "+ ADD FILES", self.music_add_files).pack(side="left", padx=(0, 4))
         self.button(foot, "+ ADD FOLDER", self.music_add_folder).pack(side="left", padx=4)
@@ -2491,6 +2558,11 @@ class App(tk.Tk):
         self.mus_was_playing = False
 
     def music_tick(self):
+        if hasattr(self, "np") and self.mus:
+            try:
+                t = Path(self.music[self.mus_idx]).stem[:28] if 0 <= self.mus_idx < len(self.music) else ""
+                self.np.config(text=(("\u266a " if self.mus_state == "playing" else "\u275a\u275a ") + t) if t and self.mus_state != "stopped" else "")
+            except Exception: pass
         if self.mus and hasattr(self, "viz"):
             try:
                 if self.mus_state == "playing":
@@ -2517,6 +2589,167 @@ class App(tk.Tk):
             bh = max(2, int(self.viz_h[i] * (h - 4))); x = i * bw
             c.create_rectangle(x + 1, h - bh, x + bw - 2, h, fill=ORANGE, outline="")
             c.create_rectangle(x + 1, h - bh, x + bw - 2, h - bh + max(2, int(2 * SC)), fill=CYAN, outline="")
+
+    # ---- library extras: sort, stats, manual add, hide, context menu, shortcuts ----------------------
+    def sort_key(self):
+        m = self.cfg.get("sort", "RELEASE")
+        if m == "RECENT": return lambda kv: -kv[1].get("last", 0)
+        if m == "MOST PLAYED": return lambda kv: -kv[1].get("playtime", 0)
+        if m == "NAME": return lambda kv: kv[1]["title"].lower()
+        return lambda kv: kv[1].get("order", 99)
+
+    def paint_sort(self):
+        self.sort_btn.config(text="SORT: " + self.cfg.get("sort", "RELEASE"))
+
+    def cycle_sort(self):
+        modes = ["RELEASE", "RECENT", "MOST PLAYED", "NAME"]
+        self.cfg["sort"] = modes[(modes.index(self.cfg.get("sort", "RELEASE")) + 1) % len(modes)]
+        save_cfg(self.cfg); self.paint_sort(); self.refresh()
+
+    def update_stats(self):
+        if not hasattr(self, "stats"): return
+        lib = self.cfg["library"]; mins = int(sum(e.get("playtime", 0) for e in lib.values()) // 60)
+        self.stats.config(text=f"{len(lib)} GAMES  \u00b7  {mins // 60}h {mins % 60:02d}m PLAYED")
+
+    def pick_title(self, system):
+        d = tk.Toplevel(self, bg=PANEL, highlightthickness=1, highlightbackground=ORANGE)
+        d.title("WHICH GAME?"); d.transient(self); d.grab_set()
+        d.geometry(f"+{self.winfo_x() + px(300)}+{self.winfo_y() + px(100)}")
+        tk.Label(d, text="\u25a0 WHICH GAME IS THIS?", bg=PANEL, fg=ORANGE, font=self.F(10, True)).pack(padx=20, pady=(16, 8))
+        res = {"v": None}
+        def pick(t): res["v"] = t; d.destroy()
+        for t, s_, o, _ in sorted(GAMES, key=lambda g: g[2]):
+            if s_ == system: self.button(d, t.upper(), lambda t=t: pick(t)).pack(fill="x", padx=20, pady=2)
+        tk.Frame(d, height=12, bg=PANEL).pack()
+        self.wait_window(d); return res["v"]
+
+    def add_game_manual(self):
+        s_ = self.ask_system()
+        if not s_: return
+        if s_ == "PS3" and messagebox.askyesno("Game type", "Is it an installed game FOLDER (not an ISO)?"):
+            p_ = filedialog.askdirectory(title="Choose the game folder")
+        else:
+            exts = " ".join("*" + e for e in sorted(EMULATORS[s_]["exts"]))
+            p_ = filedialog.askopenfilename(title="Choose the game file", filetypes=[("Game images", exts), ("All files", "*.*")])
+        if not p_: return
+        t = self.pick_title(s_)
+        if not t: return
+        self.cfg.setdefault("manual", {})[p_] = {"title": t, "system": s_, "order": next(g[2] for g in GAMES if g[0] == t)}
+        if p_ in self.cfg.get("hidden", []): self.cfg["hidden"].remove(p_)
+        self.rescan()
+
+    def hide_game(self, k):
+        e = self.cfg["library"][k]
+        if e["system"] == "PC":
+            return messagebox.showinfo("Hide", "Armored Core VI is detected through Steam. Uninstall it in Steam to remove it from the list.")
+        if not messagebox.askyesno("Hide from library", f"Hide {e['title']} from the library?\nThe game files are NOT deleted. (SYSTEM CHECK > RESTORE HIDDEN GAMES brings it back.)"): return
+        self.cfg.setdefault("hidden", []).append(k); self.cfg.get("manual", {}).pop(k, None); self.rescan()
+
+    def unhide_all(self):
+        self.cfg["hidden"] = []; self.rescan()
+
+    def open_game_folder(self, k):
+        e = self.cfg["library"][k]
+        d = e.get("dir") if e["system"] == "PC" else (k if Path(k).is_dir() else str(Path(k).parent))
+        if d: os.startfile(d) if os.name == "nt" else spawn(["xdg-open", d])
+
+    def tree_menu(self, ev):
+        iid = self.tree.identify_row(ev.y)
+        if not iid: return
+        self.tree.selection_set(iid)
+        m = tk.Menu(self, tearoff=0, bg=PANEL2, fg=TEXT, activebackground=ORANGE, activeforeground=ACC_FG, bd=0, font=self.F(9, True))
+        m.add_command(label="\u25b6  SORTIE", command=self.play)
+        m.add_command(label="\u2605  FAVORITE / UNFAVORITE", command=self.toggle_fav)
+        m.add_command(label="SETTINGS", command=self.game_settings)
+        m.add_command(label="VIEW LORE", command=self.view_lore)
+        m.add_separator()
+        m.add_command(label="OPEN GAME FOLDER", command=lambda: self.open_game_folder(iid))
+        m.add_command(label="CREATE DESKTOP SHORTCUT", command=lambda: self.make_shortcut(iid))
+        m.add_command(label="HIDE FROM LIBRARY", command=lambda: self.hide_game(iid))
+        m.tk_popup(ev.x_root, ev.y_root)
+
+    def make_shortcut(self, k):
+        if os.name != "nt":
+            return messagebox.showinfo("Shortcut", "Desktop shortcuts are only supported on Windows.")
+        e = self.cfg["library"][k]; q = lambda x: str(x).replace("'", "''")
+        frozen = getattr(sys, "frozen", False)
+        target = sys.executable
+        args = f'--play "{e["title"]}"' if frozen else f'"{os.path.abspath(sys.argv[0])}" --play "{e["title"]}"'
+        desktop = Path(os.path.expanduser("~")) / "Desktop"
+        try:   # honours a OneDrive-redirected Desktop
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"],
+                               capture_output=True, text=True, creationflags=0x08000000, timeout=15).stdout.strip()
+            if r: desktop = Path(r)
+        except Exception: pass
+        lnk = desktop / (re.sub(r'[<>:"/\\|?*]', "", e["title"]) + ".lnk")
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');$s.TargetPath='{q(target)}';"
+              f"$s.Arguments='{q(args)}';$s.WorkingDirectory='{q(Path(target).parent)}';$s.Description='Launch {q(e['title'])}';$s.Save()")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, creationflags=0x08000000, timeout=20)
+            messagebox.showinfo("Shortcut created", f"Created:\n{lnk}\n\nIt starts the launcher and plays this game straight away. You can also add it to Steam as a non-Steam game.")
+        except Exception as ex:
+            log(f"shortcut: {ex!r}"); messagebox.showerror("Shortcut", f"Couldn't create the shortcut: {ex}")
+
+    def run_autoplay(self):
+        want = norm(self.autoplay or ""); self.autoplay = None
+        for path, e in self.cfg["library"].items():
+            if norm(e["title"]) == want:
+                self.set_filter("ALL"); self.q.set("")
+                if self.tree.exists(path): self.tree.selection_set(path); return self.play()
+        messagebox.showinfo("Shortcut", "That game isn't in the library any more. Open SYSTEM CHECK or ADD FOLDER to add it.")
+
+    # ---- themes, support info, launcher updates ---------------------------------------------
+    def theme_dialog(self):
+        d = tk.Toplevel(self, bg=PANEL, highlightthickness=1, highlightbackground=ORANGE)
+        d.title("THEMES"); d.transient(self); d.grab_set()
+        d.geometry(f"{px(640)}x{min(px(600), self.winfo_screenheight() - 80)}+{self.winfo_x() + px(150)}+{self.winfo_y() + px(50)}")
+        tk.Label(d, text="\u25a0 CHOOSE A THEME", bg=PANEL, fg=ORANGE, font=self.F(13, True)).pack(anchor="w", padx=16, pady=(14, 0))
+        tk.Label(d, text="The launcher restarts to apply it.", bg=PANEL, fg=DIM, font=self.F(9)).pack(anchor="w", padx=16)
+        grid = tk.Frame(d, bg=PANEL); grid.pack(fill="both", expand=True, padx=12, pady=8)
+        def choose(name):
+            if name == THEME_NAME: return
+            if messagebox.askyesno("Theme", f"Switch to {name}? The launcher will restart.", parent=d):
+                self.cfg["theme"] = name; save_cfg(self.cfg); d.destroy(); self.restart_app()
+        def bind_all(w, name):
+            w.bind("<Button-1>", lambda e: choose(name))
+            for c in w.winfo_children(): bind_all(c, name)
+        for i, (name, pal) in enumerate(THEMES.items()):
+            card = tk.Frame(grid, bg=pal["PANEL"], highlightthickness=2, cursor="hand2",
+                            highlightbackground=ORANGE if name == THEME_NAME else pal["LINE"])
+            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6); grid.columnconfigure(i % 2, weight=1)
+            tk.Label(card, text=name + ("  (CURRENT)" if name == THEME_NAME else ""), bg=pal["PANEL"], fg=pal["TEXT"], font=self.F(11, True)).pack(anchor="w", padx=10, pady=(8, 4))
+            sw = tk.Frame(card, bg=pal["PANEL"]); sw.pack(anchor="w", padx=10, pady=(0, 10))
+            for c in ("BG", "PANEL2", "LINE", "ORANGE", "CYAN", "WARN"):
+                tk.Frame(sw, bg=pal[c], width=px(26), height=px(16)).pack(side="left", padx=2)
+            bind_all(card, name)
+        self.button(d, "CLOSE", d.destroy).pack(side="bottom", anchor="e", padx=16, pady=12)
+
+    def copy_support(self):
+        lines = [f"Build: {BUILD_ID}", f"Theme: {THEME_NAME}", f"OS: {platform.platform()}",
+                 f"Python: {sys.version.split()[0]} ({'packaged exe' if getattr(sys, 'frozen', False) else 'script'})",
+                 f"Screen: {self.winfo_screenwidth()}x{self.winfo_screenheight()} (UI scale {SC:.2f})"]
+        for s_, em in EMULATORS.items():
+            exe = self.cfg["emulators"].get(s_); ok = bool(exe and Path(exe).exists())
+            lines.append(f"{em['name']}: {'installed' if ok else 'missing'} (build {installed_version(s_) or 'unknown'}), BIOS/firmware {'ok' if self.bios_ok(s_) else 'missing'}")
+        lines.append(f"Games in library: {len(self.cfg['library'])}")
+        self.clipboard_clear(); self.clipboard_append("\n".join(lines))
+        self.typewrite("SUPPORT INFO COPIED - PASTE IT INTO YOUR BUG REPORT", 0)
+
+    def check_app_update(self):
+        if BUILD_ID == "dev": return
+        def work():
+            try:
+                data = json.loads(http_get(f"https://api.github.com/repos/{REPO}/releases/tags/latest").read().decode("utf8", "ignore"))
+                body = data.get("body") or ""
+                self.msgs.put(("appupd", bool(re.search(r"[0-9a-f]{40}", body)) and BUILD_ID not in body))
+            except Exception as ex:
+                log(f"launcher update check: {ex!r}")
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_appupd(self, newer):
+        if newer:
+            self.update_lbl.pack(side="right", padx=10)
+            self.typewrite("A NEWER LAUNCHER BUILD IS AVAILABLE - CLICK THE ORANGE NOTICE", 0)
 
     def set_emulators(self):
         for sys_, em in EMULATORS.items():
@@ -2567,6 +2800,12 @@ class App(tk.Tk):
             if messagebox.askyesno("Emulator not installed", f"{nm} isn't installed yet.\nDownload the official build now?"):
                 self.install([e["system"]], then=self.play)
             return
+        if e["system"] in ("PS1", "PS2", "PS3") and not self.bios_ok(e["system"]) and e["system"] not in self.bios_warned:
+            self.bios_warned.add(e["system"])
+            what = "firmware" if e["system"] == "PS3" else "BIOS"
+            ans = messagebox.askyesnocancel(f"{what.title()} not found", f"No {what} was found in the launcher's {EMULATORS[e['system']]['name']} folder, so the game may not start.\n\nYES = open System Check to import it\nNO = launch anyway\nCANCEL = go back")
+            if ans is None: return
+            if ans: return self.system_check()
         o = self.opts_for(k)
         if o.get("res") == "auto": o["res"] = auto_scale(e["system"], self.winfo_screenheight())   # match the display
         snap = []
@@ -2609,10 +2848,16 @@ class App(tk.Tk):
         self.restore_pending(); save_cfg(self.cfg); self.running = False
         self.deiconify(); self.status.config(fg=TEXT); self.refresh(); self.music_resume()
         self.typewrite("SORTIE COMPLETE ... WELCOME BACK, RAVEN", 0)
+        if self.cfg.get("auto_backup", True):
+            try: self.backup_saves(only=e["system"], silent=True)
+            except Exception as ex: log(f"auto backup: {ex!r}")
         if e["system"] == "PS3" and time.time() - start < 150:   # closed quickly: probably a problem
             self.after(500, lambda: self.diagnose_ps3(ask=True))
 
 
 if __name__ == "__main__":
     apply_theme(load_cfg().get("theme", "WHITE GLINT"))
-    App().mainloop()
+    auto = None
+    if "--play" in sys.argv:   # desktop shortcuts: ac_launcher --play "Armored Core: For Answer"
+        i = sys.argv.index("--play"); auto = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+    App(autoplay=auto).mainloop()

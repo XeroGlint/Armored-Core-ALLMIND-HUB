@@ -13,3 +13,5 @@ __pycache__/
 *.pup
 *.PUP
 *.pkg
+tests/out/
+test-screenshots/

@@ -45,8 +45,8 @@ BUILD_ID = "dev"   # stamped with the commit hash by the GitHub build
 # (The primary accent colour variable is called ORANGE for historical reasons.)
 THEMES = {
     "WHITE GLINT": dict(BG="#cdd6de", PANEL="#f4f7fa", PANEL2="#e2e9ef", LINE="#a9b9c6", CYAN="#14688f",
-                        TEXT="#17222b", DIM="#66798a", ORANGE="#0a8fc8", RED="#d4372a", WARN="#ff7a1a",
-                        ACC_FG="#03202e", HOV="#d0e6f2", HOV_FG="#08425f", ACC_HOV="#55c9f2",
+                        TEXT="#17222b", DIM="#66798a", ORANGE="#0785bb", RED="#d4372a", WARN="#cc5200",
+                        ACC_FG="#000a10", HOV="#d0e6f2", HOV_FG="#08425f", ACC_HOV="#55c9f2",
                         SCAN="#e3eaf0", LED_DIM="#a8d6ec", GLINT="#6fd0f7"),
     "NEXT": dict(BG="#07090c", PANEL="#0e1317", PANEL2="#141b21", LINE="#2a3a45", CYAN="#8fd8ee",
                  TEXT="#c7d4db", DIM="#5b707d", ORANGE="#ff7a1a", RED="#e5412d", WARN="#ff7a1a",
@@ -870,7 +870,7 @@ def fetch_steam_art(game, appid):
 # ---- soundtrack guide ------------------------------------------------------------------------------
 # Facts: composer credits (Wikipedia: Kota Hoshino), track details from fan wiki / reviews. "Best" = the tracks
 # fans and reviewers most often single out; opinions vary.
-OST_OVERVIEW = ("Most of the series' music is credited to Kota Hoshino, a FromSoftware composer who also plays bass and sings in the in-house band FreQuency "
+OST_OVERVIEW = ("Most of the series' music is credited to Kota Hoshino, a FromSoftware composer who also performs in the in-house band FreQuency "
                 "(formed with fellow composer Tsukasa Saitoh). The band has released arrangement albums of the series' music, including Armored Core Reprises (2011) and Sunrise (2013).\n\n"
                 "Rough picture of the eras (fan description, not a rule): the PS1 and PS2 games lean on electronic music such as techno and drum & bass; Armored Core 4 and For Answer add rock, industrial and "
                 "heavily processed vocals; Armored Core VI mixes orchestral, rock and choir, with Hoshino working alongside Takashi Onodera and Shoi Miyazawa.\n\n"
@@ -961,6 +961,7 @@ def ra_entries(key, user, lbid, title):
 
 
 # ---- in-launcher audio player (Windows MCI: no extra packages) ------------------------------------------
+AUDIO_OK = os.name == "nt"   # the audio engine is Windows-only
 AUDIO_EXTS = {".mp3", ".wav", ".wma", ".mid", ".midi", ".flac", ".m4a", ".aac", ".ogg"}
 MUSIC_DIR = CFG_PATH.parent / "music"
 
@@ -1150,10 +1151,11 @@ class App(tk.Tk):
         self.installing = False
         self.msgs = queue.Queue()
         self.photos, self.wiki, self.wiki_fail, self.fetching, self.sel_lore = {}, {}, {}, set(), None
+        self.wiki_try = {}   # last lookup time per title: stops endless retries when offline
         self.glint_x, self.glint_wait = None, 40
         self.updates, self.checking, self.check_win, self.check_body = set(), False, None, None
         self.cur_tab = "LIBRARY"
-        self.mus = McPlayer() if os.name == "nt" else None
+        self.mus = McPlayer() if AUDIO_OK else None
         self.music = [p for p in self.cfg.get("playlist", []) if os.path.exists(p)]
         self.mus_idx, self.mus_state, self.mus_started, self.mus_len, self.mus_count = -1, "stopped", 0.0, 0, 0
         self.mus_hist, self.mus_was_playing, self.viz_h = [], False, [0.05] * 32
@@ -1218,9 +1220,10 @@ class App(tk.Tk):
         left = self.panel(body, "SELECT PLATFORM"); left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
         left.config(width=190)
         self.button(left, "\u2665 SUPPORT ON KO-FI", lambda: webbrowser.open(KOFI_URL), accent=True).pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        lbox = self.scroll_body(left, width=px(178))
         self.sys_btns = {}
         for key, sub in [("ALL", "ALL FRAMES"), ("FAV", "FAVORITES")] + [(k, v["name"]) for k, v in EMULATORS.items()] + [("PC", "STEAM")]:
-            fr = tk.Frame(left, bg=PANEL, cursor="hand2"); fr.pack(fill="x", padx=8, pady=2)
+            fr = tk.Frame(lbox, bg=PANEL, cursor="hand2"); fr.pack(fill="x", padx=8, pady=2)
             bar = tk.Frame(fr, bg=PANEL, width=4); bar.pack(side="left", fill="y")
             t = tk.Label(fr, text={"FAV": "\u2605 FAVS"}.get(key, key), bg=PANEL, fg=TEXT, font=self.F(11, True), anchor="w", padx=8)
             t.pack(fill="x")
@@ -1229,11 +1232,11 @@ class App(tk.Tk):
             for w in (fr, t, u, bar):
                 w.bind("<Button-1>", lambda e, k=key: self.set_filter(k))
             self.sys_btns[key] = (bar, t)
-        tk.Frame(left, bg=LINE, height=1).pack(fill="x", padx=10, pady=10)
+        tk.Frame(lbox, bg=LINE, height=1).pack(fill="x", padx=10, pady=10)
         for txt, cmd in [("+ ADD FOLDER", self.add_folder), ("+ ADD GAME MANUALLY", self.add_game_manual),
                          ("\u21bb RESCAN", self.rescan), ("\u2713 SYSTEM CHECK", self.system_check),
                          ("\u25ce CONTROLLERS", self.controllers_dialog)]:
-            self.button(left, txt, cmd).pack(fill="x", padx=10, pady=3)
+            self.button(lbox, txt, cmd).pack(fill="x", padx=10, pady=3)
 
         # center: list
         center = tk.Frame(body, bg=BG); center.grid(row=0, column=1, sticky="nsew")
@@ -1254,9 +1257,10 @@ class App(tk.Tk):
         wrap = tk.Frame(mid, bg=PANEL); wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         cols = ("no", "title", "sys", "time")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings", style="AC.Treeview", selectmode="browse")
-        for c, t, w, a in (("no", "NO.", 50, "center"), ("title", "DESIGNATION", 400, "w"),
-                           ("sys", "PLATFORM", 80, "center"), ("time", "FLIGHT TIME", 100, "center")):
-            self.tree.heading(c, text=t); self.tree.column(c, width=px(w), anchor=a)
+        for c, t, w, a in (("no", "NO.", 46, "center"), ("title", "DESIGNATION", 250, "w"),
+                           ("sys", "PLATFORM", 74, "center"), ("time", "FLIGHT TIME", 92, "center")):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=px(w), minwidth=px(120 if c == "title" else w), anchor=a, stretch=(c == "title"))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview, style="AC.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
@@ -1268,28 +1272,29 @@ class App(tk.Tk):
         right = self.right = self.panel(body, "SORTIE DATA"); right.grid(row=0, column=2, sticky="ns", padx=(8, 0))
         right.config(width=300)
         self.button(right, "\u25b6  SORTIE", self.play, accent=True, big=True).pack(side="bottom", fill="x", padx=10, pady=12)
-        self.cover_lbl = tk.Label(right, bg=PANEL2, fg=DIM, font=self.F(8), text="NO COVER", width=18, height=6)
+        rbox = self.scroll_body(right, width=px(285))
+        self.cover_lbl = tk.Label(rbox, bg=PANEL2, fg=DIM, font=self.F(8), text="NO COVER", width=18, height=6)
         self.cover_lbl.pack(padx=12, pady=(0, 4))
         self.fields = {}
         for key in ("DESIGNATION", "PLATFORM", "EMULATOR", "STATUS", "TOTAL FLIGHT TIME", "LAST SORTIE"):
-            tk.Label(right, text=key, bg=PANEL, fg=DIM, font=self.F(8), anchor="w").pack(fill="x", padx=12, pady=(6, 0))
-            l = tk.Label(right, text="---", bg=PANEL, fg=CYAN, font=self.F(10, True), anchor="w",
+            tk.Label(rbox, text=key, bg=PANEL, fg=DIM, font=self.F(8), anchor="w").pack(fill="x", padx=12, pady=(6, 0))
+            l = tk.Label(rbox, text="---", bg=PANEL, fg=CYAN, font=self.F(10, True), anchor="w",
                          justify="left", wraplength=px(265))
             l.pack(fill="x", padx=12); self.fields[key] = l
-        tk.Frame(right, bg=LINE, height=1).pack(fill="x", padx=10, pady=10)
+        tk.Frame(rbox, bg=LINE, height=1).pack(fill="x", padx=10, pady=10)
         self.fs = tk.BooleanVar(value=self.cfg.get("fullscreen", True))
-        tk.Checkbutton(right, text=" FULLSCREEN", variable=self.fs, bg=PANEL, fg=TEXT, selectcolor=BG,
+        tk.Checkbutton(rbox, text=" FULLSCREEN", variable=self.fs, bg=PANEL, fg=TEXT, selectcolor=BG,
                        activebackground=PANEL, activeforeground=CYAN, font=self.F(9, True),
                        highlightthickness=0, bd=0, anchor="w").pack(fill="x", padx=10)
-        r1 = tk.Frame(right, bg=PANEL); r1.pack(fill="x", padx=10, pady=(8, 3))
+        r1 = tk.Frame(rbox, bg=PANEL); r1.pack(fill="x", padx=10, pady=(8, 3))
         self.button(r1, "VIEW LORE", self.view_lore).pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.button(r1, "\u2605 FAVORITE", self.toggle_fav).pack(side="left", fill="x", expand=True, padx=(3, 0))
-        r2 = tk.Frame(right, bg=PANEL); r2.pack(fill="x", padx=10, pady=3)
+        r2 = tk.Frame(rbox, bg=PANEL); r2.pack(fill="x", padx=10, pady=3)
         self.button(r2, "SETTINGS", self.game_settings).pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.button(r2, "EMU FOLDER", self.open_emu_dir).pack(side="left", fill="x", expand=True, padx=(3, 0))
 
         # status bar
-        sbar = tk.Frame(self, bg=PANEL2, height=px(26)); sbar.pack(fill="x", side="bottom")
+        sbar = tk.Frame(self, bg=PANEL2, height=px(26)); sbar.pack(fill="x", side="bottom", before=body)
         self.led = tk.Label(sbar, text="\u25cf", bg=PANEL2, fg=CYAN, font=self.F(10)); self.led.pack(side="left", padx=(10, 4))
         self.status = tk.Label(sbar, text="", bg=PANEL2, fg=TEXT, font=self.F(9)); self.status.pack(side="left")
         self.clock = tk.Label(sbar, text="", bg=PANEL2, fg=DIM, font=self.F(9)); self.clock.pack(side="right", padx=10)
@@ -1448,7 +1453,7 @@ class App(tk.Tk):
     # ---- tabs / archive ---------------------------------------------------------
     def build_tabs(self, center):
         self.tab_frames, self.tab_btns = {}, {}
-        bar = tk.Frame(center, bg=BG); bar.pack(fill="x", pady=(0, 6))
+        bar = tk.Frame(self, bg=BG); bar.pack(fill="x", padx=10, pady=(0, 6), before=center.master)
         for name in ("LIBRARY", "ARCHIVE", "SOUNDTRACKS", "MUSIC", "ACHIEVEMENTS"):
             b = tk.Label(bar, text=name, bg=PANEL2, fg=TEXT, font=self.F(10, True), padx=22, pady=6,
                          cursor="hand2", highlightthickness=1, highlightbackground=LINE)
@@ -1468,7 +1473,7 @@ class App(tk.Tk):
         a = self.panel(center, "ARCHIVE // LORE & HISTORY"); self.tab_frames["ARCHIVE"] = a
         row = tk.Frame(a, bg=PANEL); row.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.lore_tree = ttk.Treeview(row, show="tree", style="AC.Treeview", selectmode="browse")
-        self.lore_tree.column("#0", width=px(270))
+        self.lore_tree.column("#0", width=px(345))
         self.lore_tree.insert("", "end", iid="__overview", text="00  SERIES OVERVIEW")
         for title, sys_, order, _ in sorted(GAMES, key=lambda g: g[2]):
             self.lore_tree.insert("", "end", iid=title, text=f"{order:02d}  {title.upper()}  [{sys_}]")
@@ -1522,7 +1527,8 @@ class App(tk.Tk):
             else:
                 self.set_img(self.lore_img, None)
                 if k in self.wiki_fail:
-                    t.insert("end", f"Could not load ({self.wiki_fail.pop(k)}). Needs internet; select again to retry.", "dim")
+                    t.insert("end", f"Could not load ({self.wiki_fail[k]}). Needs internet. It retries when you select this game again after a minute.", "dim")
+                    self.fetch_art(k)
                 else:
                     t.insert("end", "Retrieving data ...", "dim"); self.fetch_art(k)
         t.config(state="disabled")
@@ -1554,6 +1560,8 @@ class App(tk.Tk):
     # ---- online art / wiki data --------------------------------------------------
     def fetch_art(self, title):
         if title in self.wiki or title in self.fetching or (title not in LORE and title != "__overview"): return
+        if time.time() - self.wiki_try.get(title, 0) < 90: return   # failed recently: wait before trying again
+        self.wiki_try[title] = time.time(); self.wiki_fail.pop(title, None)
         self.fetching.add(title)
         def work():
             try: self.msgs.put(("wiki", title, fetch_all(title, LORE[title][1] if title in LORE else "Armored Core", next((g[1] for g in GAMES if g[0] == title), None)), None))
@@ -1667,7 +1675,7 @@ class App(tk.Tk):
 
     # ---- startup check, updates, saves, theme, favorites --------------------------
     def startup(self):
-        self.restore_pending()
+        if not self.running: self.restore_pending()
         self.rescan()
         if self.setup_needed() and not self.cfg.get("skip_wizard"):
             self.system_check()
@@ -1700,7 +1708,7 @@ class App(tk.Tk):
         w.geometry(f"{px(780)}x{min(px(760), self.winfo_screenheight() - 80)}+{self.winfo_x() + px(90)}+{self.winfo_y() + px(20)}")
         tk.Label(w, text="\u25a0 PRE-SORTIE SYSTEM CHECK", bg=PANEL, fg=ORANGE, font=self.F(13, True)).pack(anchor="w", padx=16, pady=(14, 0))
         tk.Label(w, text="PS1/PS2 BIOS must be your own dump. PS3 firmware can be fetched from Sony's official link via RPCS3's own page.",
-                 bg=PANEL, fg=DIM, font=self.F(9)).pack(anchor="w", padx=16, pady=(0, 8))
+                 bg=PANEL, fg=DIM, font=self.F(9), wraplength=px(720), justify="left").pack(anchor="w", padx=16, pady=(0, 8))
         foot = tk.Frame(w, bg=PANEL); foot.pack(side="bottom", fill="x", padx=16, pady=12)
         self.check_body = tk.Frame(w, bg=PANEL); self.check_body.pack(fill="both", expand=True, padx=16)
         for text, key, dflt in ((" AUTO-UPDATE EMULATORS AT STARTUP", "auto_update", True),
@@ -1848,36 +1856,40 @@ class App(tk.Tk):
         sh = self.winfo_screenheight()
         d.geometry(f"{px(700)}x{min(px(780), sh - 80)}+{self.winfo_x() + px(100)}+{self.winfo_y() + px(20)}")
         foot = tk.Frame(d, bg=PANEL); foot.pack(side="bottom", fill="x", padx=16, pady=12)
+        foot2 = tk.Frame(d, bg=PANEL); foot2.pack(side="bottom", fill="x", padx=16)
+        foot3 = tk.Frame(d, bg=PANEL)
+        if s == "PS3": foot3.pack(side="bottom", fill="x", padx=16, pady=(0, 4))
         tk.Label(d, text="\u25a0 " + e["title"].upper(), bg=PANEL, fg=ORANGE, font=self.F(12, True)).pack(anchor="w", padx=16, pady=(14, 0))
         tk.Label(d, text=f"{EMULATORS[s]['name']}  //  applied automatically every time you press SORTIE",
                  bg=PANEL, fg=DIM, font=self.F(9)).pack(anchor="w", padx=16, pady=(0, 6))
+        box = self.scroll_body(d)
         if e["title"] in NOTES:
-            tk.Label(d, text=NOTES[e["title"]], bg=PANEL2, fg=TEXT, font=self.F(9), wraplength=px(620), justify="left",
+            tk.Label(box, text=NOTES[e["title"]], bg=PANEL2, fg=TEXT, font=self.F(9), wraplength=px(620), justify="left",
                      padx=10, pady=8).pack(fill="x", padx=16, pady=(0, 6))
         if s == "PS3" and e["title"] == "Armored Core: For Answer" and cur.get("wcb") and (auto_scale("PS3", self.winfo_screenheight()) if cur.get("res") == "auto" else cur.get("res", 100)) > 100:
-            tk.Label(d, text="WARNING: Write Color Buffers with a resolution above 1x is known to crash For Answer (RPCS3 issue #11984). Use 1x or press RECOMMENDED PRESET.",
+            tk.Label(box, text="WARNING: Write Color Buffers with a resolution above 1x is known to crash For Answer (RPCS3 issue #11984). Use 1x or press RECOMMENDED PRESET.",
                      bg=PANEL2, fg=RED, font=self.F(9, True), wraplength=px(620), justify="left", padx=10, pady=6).pack(fill="x", padx=16, pady=(0, 6))
         res = {"PS3": [("1x  720p", 100), ("1.5x  1080p", 150), ("2x  1440p", 200), ("3x  4K", 300)],
                "PS1": [(f"{n}x", n) for n in (1, 2, 4, 6, 8)], "PS2": [(f"{n}x", n) for n in (1, 2, 3, 4, 6)],
                "PSP": [(f"{n}x", n) for n in (1, 2, 3, 4, 5)]}[s]
         auto_val = auto_scale(s, self.winfo_screenheight())
         unit = "%" if s == "PS3" else "x"
-        self.choice_row(d, "RESOLUTION (INTERNAL SCALE)", [("AUTO", "auto")] + res, cur, "res",
+        self.choice_row(box, "RESOLUTION (INTERNAL SCALE)", [("AUTO", "auto")] + res, cur, "res",
                         f"AUTO matches your {self.winfo_screenwidth()}x{self.winfo_screenheight()} display: currently {auto_val}{unit}. "
                         + ("PS3 values are a percent of the game's native 720p (150% = 1080p)." if s == "PS3" else "Higher looks sharper but needs a stronger GPU."))
         if s == "PS3":
-            self.choice_row(d, "FRAME LIMIT", [("AUTO", "Auto"), ("60", "60"), ("30", "30"), ("UNLIMITED", "Off")], cur, "fps")
-            self.choice_row(d, "WRITE COLOR BUFFERS", [("ON", True), ("OFF", False)], cur, "wcb",
+            self.choice_row(box, "FRAME LIMIT", [("AUTO", "Auto"), ("60", "60"), ("30", "30"), ("UNLIMITED", "Off")], cur, "fps")
+            self.choice_row(box, "WRITE COLOR BUFFERS", [("ON", True), ("OFF", False)], cur, "wcb",
                             "Leave ON for For Answer. Some other games prefer it off.")
-            self.choice_row(d, "VSYNC", [("OFF", False), ("ON", True)], cur, "vsync", "Default OFF. Turn on only if you see screen tearing.")
-            self.choice_row(d, "ANISOTROPIC FILTERING", [("AUTO", 0), ("2x", 2), ("4x", 4), ("8x", 8), ("16x", 16)], cur, "af")
-            self.choice_row(d, "HANDLE RSX MEMORY TILING", [("OFF", False), ("ON", True)], cur, "tiling",
+            self.choice_row(box, "VSYNC", [("OFF", False), ("ON", True)], cur, "vsync", "Default OFF. Turn on only if you see screen tearing.")
+            self.choice_row(box, "ANISOTROPIC FILTERING", [("AUTO", 0), ("2x", 2), ("4x", 4), ("8x", 8), ("16x", 16)], cur, "af")
+            self.choice_row(box, "HANDLE RSX MEMORY TILING", [("OFF", False), ("ON", True)], cur, "tiling",
                             "RPCS3 wiki: ON fixes most For Answer logo and AC texture corruption.")
         if s in ("PS1", "PS2"):
-            self.choice_row(d, "WIDESCREEN", [("ON", True), ("OFF", False)], cur, "ws",
+            self.choice_row(box, "WIDESCREEN", [("ON", True), ("OFF", False)], cur, "ws",
                             "PS2: uses PCSX2's built-in widescreen patches where one exists for the game." if s == "PS2"
                             else "PS1: stretches the 3D view; the image can look odd at the edges.")
-        row = tk.Frame(d, bg=PANEL); row.pack(fill="x", padx=16, pady=5)
+        row = tk.Frame(box, bg=PANEL); row.pack(fill="x", padx=16, pady=5)
         tk.Label(row, text="EXTRA COMMAND-LINE ARGS (ADVANCED)", bg=PANEL, fg=DIM, font=self.F(8, True)).pack(anchor="w")
         av = tk.StringVar(value=e.get("args", ""))
         tk.Entry(row, textvariable=av, bg=BG, fg=CYAN, insertbackground=CYAN, relief="flat", font=self.F(10),
@@ -1887,17 +1899,46 @@ class App(tk.Tk):
             self.typewrite("SETTINGS SAVED - APPLIED ON NEXT SORTIE", 0)
         def reset():
             e.pop("opts", None); d.destroy(); self.game_settings()
-        foot2 = tk.Frame(d, bg=PANEL); foot2.pack(side="bottom", fill="x", padx=16)
         self.button(foot, "SAVE", save, accent=True).pack(side="right")
         self.button(foot, "CANCEL", d.destroy).pack(side="right", padx=6)
         self.button(foot, "RECOMMENDED PRESET", reset).pack(side="left")
         if s == "PS3":
-            foot3 = tk.Frame(d, bg=PANEL); foot3.pack(side="bottom", fill="x", padx=16, pady=(0, 4))
             self.button(foot3, "DIAGNOSE LAST RUN", self.diagnose_ps3, accent=True).pack(side="left", padx=(0, 6))
             self.button(foot3, "OPEN RPCS3 LOG", lambda: self.open_log(s)).pack(side="left")
         self.button(foot2, "CONTROLLER SETUP", lambda: self.controller_setup(s)).pack(side="left", padx=(0, 6))
         self.button(foot2, "SAVE SLOTS", self.save_slots).pack(side="left", padx=(0, 6))
         if s == "PS3": self.button(foot2, "GET GAME UPDATE", lambda: self.ps3_update(k)).pack(side="left")
+
+    def scroll_body(self, parent, width=None):
+        """A vertically scrollable area (mouse wheel + scrollbar). Returns the inner frame to put widgets in."""
+        wrap = tk.Frame(parent, bg=PANEL); wrap.pack(fill="both", expand=True)
+        cv = tk.Canvas(wrap, bg=PANEL, highlightthickness=0, **({"width": width} if width else {}))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview, style="AC.Vertical.TScrollbar")
+        inner = tk.Frame(cv, bg=PANEL); cv._inner = inner
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        cv.configure(yscrollcommand=sb.set)
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        cv.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        def wheel(e): cv.yview_scroll(-1 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 1, "units")
+        def on(_): [cv.bind_all(ev, wheel) for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>")]
+        def off(_): [cv.unbind_all(ev) for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>")]
+        wrap.bind("<Enter>", on); wrap.bind("<Leave>", off)
+        return inner
+
+    def pad_reveal(self, w):   # scroll a controller-selected widget into view
+        p = w
+        while p is not None:
+            if isinstance(p, tk.Canvas) and hasattr(p, "_inner"):
+                try:
+                    self.update_idletasks()
+                    y = w.winfo_rooty() - p._inner.winfo_rooty(); h = max(1, p._inner.winfo_height())
+                    top, view = p.canvasy(0), p.winfo_height()
+                    if y < top: p.yview_moveto(max(0, y - 6) / h)
+                    elif y + w.winfo_height() > top + view: p.yview_moveto((y + w.winfo_height() - view + 6) / h)
+                except tk.TclError: pass
+                return
+            p = getattr(p, "master", None)
 
     def open_log(self, s):
         exe = self.cfg["emulators"].get(s)
@@ -2246,7 +2287,7 @@ class App(tk.Tk):
         a = self.panel(center, "SOUNDTRACKS // THE SOUND OF ARMORED CORE"); self.tab_frames["SOUNDTRACKS"] = a
         row = tk.Frame(a, bg=PANEL); row.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.ost_tree = ttk.Treeview(row, show="tree", style="AC.Treeview", selectmode="browse")
-        self.ost_tree.column("#0", width=px(300))
+        self.ost_tree.column("#0", width=px(345))
         self.ost_tree.insert("", "end", iid="__overview", text="00  SERIES SOUND OVERVIEW")
         for i, t in enumerate(SOUNDTRACKS, 1):
             self.ost_tree.insert("", "end", iid=t[0], text=f"{i:02d}  {t[1]}")
@@ -2546,6 +2587,7 @@ class App(tk.Tk):
 
     def music_clear(self):
         self.music_stop(); self.music = []; self.mus_idx = -1; self.cfg["playlist"] = []; save_cfg(self.cfg); self.music_refresh_list()
+        self.lcd_title.config(text="NO TRACK LOADED"); self.lcd_time.config(text="00:00 / 00:00")
 
     def music_play_selected(self):
         sel = self.music_tree.selection()
@@ -2918,6 +2960,7 @@ class App(tk.Tk):
 
     def pad_set(self, w):
         self.pad_clear(); self.pad_cur = w
+        self.pad_reveal(w)
         tgt = w
         try: w.cget("highlightthickness")
         except Exception: tgt = w.master        # ttk widgets: ring their container instead

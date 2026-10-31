@@ -2,7 +2,7 @@ name: Build Windows app
 
 # Builds ArmoredCoreLauncher.exe on every commit pushed to any branch.
 #  - every build: downloadable from the run's "Artifacts" section
-#  - pushes to main: also refreshes a public "Latest build" release (tag: latest)
+#  - pushes to the default branch: also refreshes a public "Latest build" release (tag: latest)
 #  - tags like v1.0: creates a normal versioned release
 on:
   push:
@@ -13,17 +13,17 @@ on:
 permissions:
   contents: write
 
+# Newer pushes cancel older builds of the same branch, but never a build that is publishing the default branch.
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Fetches full history so tag manipulation works reliably
 
       - uses: actions/setup-python@v5
         with:
@@ -32,10 +32,18 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Check the code compiles
+        run: python -m py_compile ac_launcher.py
+
       - name: Stamp the build with the commit hash
         run: python .github/stamp.py
 
-      - run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py
+      - name: Build the exe
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py
+
+      - name: Check the exe was produced
+        shell: bash
+        run: test -s dist/ArmoredCoreLauncher.exe && ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -43,32 +51,26 @@ jobs:
           path: dist/ArmoredCoreLauncher.exe
 
       - name: Move the "latest" tag to this commit
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         shell: bash
         run: |
-          # Configure official GitHub Actions Bot credentials
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # Forcefully update the tag to point exactly to this commit SHA
-          git tag -f latest ${{ github.sha }}
-          
-          # Force push the tag back to the remote repository
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git tag -f latest
           git push -f origin latest
 
       - name: Publish the rolling "Latest build" release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest build (main)
+          name: Latest build
           prerelease: true
-          body: "Automatic build of the newest commit on main (${{ github.sha }}). Unsigned: Windows may show an unknown-publisher warning."
+          body: "Automatic build of the newest commit (${{ github.sha }}). Unsigned: Windows may show an unknown-publisher warning."
           files: dist/ArmoredCoreLauncher.exe
 
       - name: Publish a versioned release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }} # Explicitly target the correct tag name
           files: dist/ArmoredCoreLauncher.exe

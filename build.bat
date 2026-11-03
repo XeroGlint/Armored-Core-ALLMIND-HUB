@@ -17,7 +17,7 @@ if exist dist\ArmoredCoreLauncher.exe (
 )
 
 py %PYV% -m pip install -r requirements.txt || goto :err
-py %PYV% -m PyInstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py || goto :err
+py %PYV% -m PyInstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher --icon assets\icon.ico --add-data "assets\icon.png;assets" --add-data "assets\icon.ico;assets" ac_launcher.py || goto :err
 echo.
 echo Done: dist\ArmoredCoreLauncher.exe
 pause & exit /b 0

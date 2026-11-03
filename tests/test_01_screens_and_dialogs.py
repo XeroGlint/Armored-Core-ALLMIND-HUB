@@ -5,6 +5,7 @@ app = new_app()
 lib = lambda: app.cfg["library"]
 key_for = lambda title: next(k for k, e in lib().items() if e["title"] == title)
 
+check("the app icon is loaded (title bar and dialogs)", app._icon is not None and pathlib.Path(a.resource_path("assets/icon.ico")).exists())
 check("library lists every game (incl. Armored Core VI via Steam)", len(app.tree.get_children()) == 9, str(len(app.tree.get_children())))
 shot("library")
 for tab in ("ARCHIVE", "SOUNDTRACKS", "MUSIC", "ACHIEVEMENTS", "LIBRARY"):

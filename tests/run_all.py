@@ -3,7 +3,7 @@ The small-screen test is separate:  xvfb-run -a -s "-screen 0 1024x640x24" pytho
 import pathlib, subprocess, sys
 here = pathlib.Path(__file__).resolve().parent
 failed = 0
-for t in sorted(here.glob("test_0[1-7]_*.py")):
+for t in sorted(p for p in here.glob("test_*.py") if "small_screen" not in p.name):
     r = subprocess.run([sys.executable, str(t)], capture_output=True, text=True, timeout=300)
     lines = [l for l in r.stdout.splitlines() if l.startswith(("PASS", "FAIL"))]
     bad = [l for l in lines if l.startswith("FAIL")]

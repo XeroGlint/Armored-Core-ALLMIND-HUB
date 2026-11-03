@@ -20,6 +20,10 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 try:
     from PIL import Image, ImageTk
     HAVE_PIL = True
+    try:
+        import PIL._tkinter_finder  # noqa: F401  (named explicitly so the packaged exe includes it; without it no pictures show)
+    except ImportError:
+        pass
 except ImportError:  # app still works, just without images
     HAVE_PIL = False
 
@@ -31,6 +35,11 @@ if os.name == "nt":  # must run before Tk starts, otherwise Windows bitmap-stret
         try: ctypes.windll.user32.SetProcessDPIAware()
         except Exception: pass
 SC = 1.0
+
+
+def resource_path(rel):
+    """Path to a bundled file, both when run from source and inside the packaged exe."""
+    return os.path.join(getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__)), rel)
 
 
 def px(n):
@@ -1128,6 +1137,14 @@ class App(tk.Tk):
         self.autoplay = autoplay
         global SC
         SC = max(1.0, self.winfo_fpixels("1i") / 96)
+        self._icon = None
+        try:
+            if HAVE_PIL:   # title bar, taskbar and every dialog use the app icon
+                self._icon = ImageTk.PhotoImage(Image.open(resource_path("assets/icon.png")).convert("RGBA").resize((64, 64), Image.LANCZOS))
+                self.iconphoto(True, self._icon)
+            if os.name == "nt": self.iconbitmap(default=resource_path("assets/icon.ico"))
+        except Exception as ex:
+            log(f"window icon: {ex!r}")
         self.title("ARMORED CORE // LAUNCHER")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(px(1180), sw - 60)}x{min(px(820), sh - 100)}")
@@ -1510,7 +1527,8 @@ class App(tk.Tk):
             self.lore_title.config(text="ARMORED CORE"); self.lore_meta.config(text="FROMSOFTWARE  //  1997 - PRESENT")
             t.insert("end", OVERVIEW)
             w = self.wiki.get("__overview")
-            self.set_img(self.lore_img, self.photo(w.get("img"), (px(130), px(180))) if w else None)
+            art = self.photo(w.get("img"), (px(130), px(180))) if (w and w.get("img")) else None
+            self.set_img(self.lore_img, art or self.photo(resource_path("assets/icon.png"), (px(150), px(150))))
             if not w: self.fetch_art("__overview")
         else:
             _, sys_, _, _ = next(g for g in GAMES if g[0] == k)
@@ -1584,7 +1602,8 @@ class App(tk.Tk):
             try:
                 im = Image.open(path).convert("RGB"); im.thumbnail(box)
                 self.photos[key] = ImageTk.PhotoImage(im)
-            except Exception:
+            except Exception as ex:
+                log(f"picture {Path(path).name}: {ex!r}")
                 return None
         return self.photos[key]
 
@@ -2794,7 +2813,8 @@ class App(tk.Tk):
         except Exception: pass
         lnk = desktop / (re.sub(r'[<>:"/\\|?*]', "", e["title"]) + ".lnk")
         ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');$s.TargetPath='{q(target)}';"
-              f"$s.Arguments='{q(args)}';$s.WorkingDirectory='{q(Path(target).parent)}';$s.Description='Launch {q(e['title'])}';$s.Save()")
+              f"$s.Arguments='{q(args)}';$s.WorkingDirectory='{q(Path(target).parent)}';$s.Description='Launch {q(e['title'])}';"
+              f"$s.IconLocation='{q(target + ',0' if frozen else resource_path('assets/icon.ico'))}';$s.Save()")
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True, creationflags=0x08000000, timeout=20)
             messagebox.showinfo("Shortcut created", f"Created:\n{lnk}\n\nIt starts the launcher and plays this game straight away. You can also add it to Steam as a non-Steam game.")
@@ -3144,6 +3164,19 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:   # CI smoke test: open the window, check the icon loaded, write a report, exit
+        i = sys.argv.index("--selftest")
+        out = Path(sys.argv[i + 1]) if i + 1 < len(sys.argv) else CFG_PATH.parent / "selftest.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            t = App()
+            for _ in range(8): t.update(); time.sleep(0.05)   # shorter than the 700 ms startup routine
+            ok = t._icon is not None and os.path.exists(resource_path("assets/icon.ico")) and bool(t.tab_frames)
+            out.write_text(f"ok={ok} icon={t._icon is not None} frozen={getattr(sys, 'frozen', False)} build={BUILD_ID[:7]}\n", encoding="utf8")
+            t.destroy()
+        except Exception as ex:
+            out.write_text(f"ok=False error={ex!r}\n", encoding="utf8"); ok = False
+        sys.exit(0 if ok else 1)
     apply_theme(load_cfg().get("theme", "WHITE GLINT"))
     auto = None
     if "--play" in sys.argv:   # desktop shortcuts: ac_launcher --play "Armored Core: For Answer"

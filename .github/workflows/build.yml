@@ -39,11 +39,19 @@ jobs:
         run: python .github/stamp.py
 
       - name: Build the exe
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher ac_launcher.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name ArmoredCoreLauncher --icon assets/icon.ico --add-data "assets/icon.png;assets" --add-data "assets/icon.ico;assets" ac_launcher.py
 
       - name: Check the exe was produced
         shell: bash
         run: test -s dist/ArmoredCoreLauncher.exe && ls -l dist
+
+      - name: Smoke-test the exe (opens the window, checks the icon, then closes)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\ArmoredCoreLauncher.exe -ArgumentList "--selftest","$PWD\selftest.txt" -Wait -PassThru
+          if (Test-Path selftest.txt) { Get-Content selftest.txt }
+          exit $p.ExitCode
 
       - uses: actions/upload-artifact@v4
         with:

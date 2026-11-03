@@ -1,4 +1,8 @@
-# Armored Core Launcher
+<p align="center"><img src="assets/icon.png" width="220" alt="Armored Core ALLMIND HUB"></p>
+
+# Armored Core ALLMIND HUB
+
+(Armored Core Launcher)
 
 Fan-made launcher for every mainline Armored Core before Armored Core VI (PS1, PS2, PSP, PS3).
 It downloads and manages the official emulators (DuckStation, PCSX2, PPSSPP, RPCS3) for you,
